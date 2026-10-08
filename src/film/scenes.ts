@@ -9,7 +9,7 @@
 export const FPS = 24
 
 /** Scroll distance per second of footage, in viewport heights. */
-export const VH_PER_SECOND = 40
+export const VH_PER_SECOND = 56
 
 export type CaptionSide = 'left' | 'left-top' | 'center'
 

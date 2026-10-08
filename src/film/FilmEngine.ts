@@ -127,7 +127,7 @@ export class FilmEngine {
   private lastTs = 0
   private raf = 0
   private running = false
-  private stiffness = 9
+  private stiffness = 6
   private active = -1
   private chapter = -1
   private stageScale = 1
@@ -269,8 +269,8 @@ export class FilmEngine {
     this.targetY = window.scrollY
     this.wake()
   }
-  private onTouch = () => (this.stiffness = 16) // touch already has native momentum — follow it closely
-  private onWheel = () => (this.stiffness = 9) // wheel steps are coarse — ease them into a glide
+  private onTouch = () => (this.stiffness = 11) // touch already has native momentum — follow it closely
+  private onWheel = () => (this.stiffness = 6) // wheel steps are coarse — ease them into a glide
   private onPointer = (e: PointerEvent) => {
     this.ptrTarget.x = (e.clientX / this.vw) * 2 - 1
     this.ptrTarget.y = (e.clientY / this.vh) * 2 - 1
