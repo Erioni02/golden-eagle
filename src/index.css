@@ -1,0 +1,492 @@
+@import '@fontsource-variable/geist/wght.css';
+@import '@fontsource-variable/geist/wght-italic.css';
+@import '@fontsource-variable/geist-mono';
+@import 'tailwindcss';
+
+/* Layout modes (the film's type sits on video, so placement is decided by the frame's shape):
+   stack = phones and portrait tablets → copy docks to the bottom edge
+   short = landscape phones / very short windows → compact cards, smaller type */
+@custom-variant stack {
+  @media (max-width: 767px) {
+    @slot;
+  }
+  @media (max-width: 1023px) and (orientation: portrait) {
+    @slot;
+  }
+}
+@custom-variant short (@media (max-height: 560px));
+
+@theme {
+  --font-sans: 'Geist Variable', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: 'Geist Mono Variable', ui-monospace, 'SFMono-Regular', monospace;
+
+  --color-ink: #050505;
+  --color-cream: #f4efe6;
+  --color-gold: #f2c230;
+  --color-gold-soft: #f6d77d;
+  --color-eagle-blue: #2c4280;
+  --color-eagle-red: #e0342f;
+
+  /* motion tokens */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+    --safe-t: env(safe-area-inset-top, 0px);
+    --safe-b: env(safe-area-inset-bottom, 0px);
+    --gutter: clamp(16px, 3.4vw, 52px);
+    --lb: 12vh; /* letterbox bar height */
+    --tone: #f2c230; /* flavor light: the engine retints this per scene */
+
+    /* Type scale. Each step is bounded by width AND height so a short laptop or a
+       landscape phone never gets a headline taller than its frame. */
+    --t-hero: clamp(2.6rem, min(7.2vw, 12.5vh), 8.2rem);
+    --t-h2: clamp(2.4rem, min(5.6vw, 10.5vh), 6.4rem);
+    --t-h2-long: clamp(2.2rem, min(4.5vw, 8.8vh), 5.2rem);
+    --t-h2-side: clamp(2.2rem, min(3.8vw, 8vh), 4.2rem);
+    --t-mega: clamp(4.2rem, min(11vw, 21vh), 12rem);
+    --t-card: clamp(2.5rem, min(4.2vw, 8vh), 4.4rem);
+    --t-section: clamp(3rem, min(8.4vw, 15vh), 9.5rem);
+  }
+
+  @media (max-width: 767px) {
+    :root {
+      --lb: 7vh;
+    }
+  }
+
+  html {
+    background: var(--color-ink);
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-ink);
+    color: var(--color-cream);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    overflow-x: clip;
+  }
+
+  html.is-loading {
+    overflow: hidden;
+  }
+
+  ::selection {
+    background: var(--color-gold);
+    color: var(--color-ink);
+  }
+
+  :focus-visible {
+    outline: 1.5px solid var(--color-gold-soft);
+    outline-offset: 4px;
+  }
+
+  img {
+    -webkit-user-drag: none;
+  }
+}
+
+/* Custom classes live in the components layer so Tailwind utilities can still override them. */
+@layer components {
+  /* ─────────────────────────── typography system
+     Display: Geist, tight, mixed case.  Accent: Instrument Serif italic.
+     Labels: Geist Mono — the film-credit / timecode voice. */
+
+  .display {
+    font-family: var(--font-sans);
+    font-weight: 560;
+    letter-spacing: -0.055em;
+    line-height: 0.9;
+    text-wrap: balance;
+  }
+
+  /* Emphasis = the same family, italic, in the brand gold (no second typeface). */
+  .accent {
+    font-style: italic;
+    font-weight: 480;
+    letter-spacing: -0.045em;
+    color: var(--color-gold-soft);
+    padding-right: 0.06em; /* italic overhang */
+  }
+
+  .label {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    font-weight: 450;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Eyebrow tag: microscopic pill that precedes every headline */
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6em;
+    border-radius: 999px;
+    padding: 0.42rem 0.85rem;
+    background: rgb(255 255 255 / 0.06);
+    box-shadow:
+      inset 0 0 0 1px rgb(255 255 255 / 0.14),
+      inset 0 1px 0 rgb(255 255 255 / 0.12);
+    color: rgb(244 239 230 / 0.86);
+  }
+
+  .shadow-text {
+    text-shadow:
+      0 2px 40px rgb(0 0 0 / 0.35),
+      0 1px 2px rgb(0 0 0 / 0.25);
+  }
+
+  /* Each word rises out of its own clipping line (the engine drives the inner transform). */
+  .word {
+    display: inline-block;
+    overflow: clip;
+    overflow-clip-margin: 0.08em;
+    vertical-align: top;
+    /* descender + italic clearance (g, y, p in "energy", "Waiting") */
+    padding: 0 0.04em 0.16em 0;
+    margin: 0 -0.04em -0.16em 0;
+  }
+  .word > span {
+    display: inline-block;
+  }
+
+  /* ─────────────────────────── liquid glass, double-bezel
+     .bezel = the frosted outer tray: carries the backdrop blur + a hairline, padded like machined hardware.
+     .core  = the plate seated inside it: tinted body, refractive rim (::before), specular sheen (::after).
+     The blur lives on the outermost element on purpose — an ancestor with opacity < 1 (a fading
+     caption) would otherwise switch the blur off mid-fade.
+     Blur is only used on fixed surfaces (nav, badge, film cards) — never on scrolling content. */
+
+  .bezel {
+    position: relative;
+    border-radius: var(--r, 2rem);
+    padding: var(--bz, 6px);
+    background: linear-gradient(180deg, rgb(255 255 255 / 0.13), rgb(255 255 255 / 0.04));
+    -webkit-backdrop-filter: blur(26px) saturate(165%);
+    backdrop-filter: blur(26px) saturate(165%);
+    box-shadow:
+      inset 0 0 0 1px rgb(255 255 255 / 0.11),
+      inset 0 1px 0 rgb(255 255 255 / 0.16),
+      0 30px 80px -30px rgb(0 0 0 / 0.5);
+  }
+  /* same tray, no blur — for tiles inside scrolling content */
+  .bezel-flat {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    background: linear-gradient(180deg, rgb(255 255 255 / 0.07), rgb(255 255 255 / 0.02));
+  }
+  .bezel > .core {
+    border-radius: calc(var(--r, 2rem) - var(--bz, 6px));
+  }
+
+  .core {
+    position: relative;
+    isolation: isolate;
+    background:
+      linear-gradient(165deg, rgb(255 255 255 / 0.1) 0%, rgb(255 255 255 / 0.015) 40%, rgb(255 255 255 / 0.04) 100%),
+      rgb(8 8 10 / 0.5);
+    box-shadow:
+      inset 0 1px 1px rgb(255 255 255 / 0.2),
+      inset 0 -1px 0 rgb(255 255 255 / 0.04);
+  }
+  .core-light {
+    background:
+      linear-gradient(165deg, rgb(255 255 255 / 0.12) 0%, rgb(255 255 255 / 0.03) 40%, rgb(255 255 255 / 0.05) 100%),
+      rgb(10 10 12 / 0.22);
+  }
+
+  .glass {
+    position: relative;
+    isolation: isolate;
+    background:
+      linear-gradient(165deg, rgb(255 255 255 / 0.14) 0%, rgb(255 255 255 / 0.03) 38%, rgb(255 255 255 / 0.06) 100%),
+      rgb(10 10 12 / 0.38);
+    -webkit-backdrop-filter: blur(24px) saturate(170%);
+    backdrop-filter: blur(24px) saturate(170%);
+    box-shadow:
+      inset 0 1px 1px rgb(255 255 255 / 0.22),
+      inset 0 -1px 0 rgb(255 255 255 / 0.05);
+  }
+  .glass-deep {
+    background:
+      linear-gradient(165deg, rgb(255 255 255 / 0.11) 0%, rgb(255 255 255 / 0.02) 40%, rgb(255 255 255 / 0.05) 100%),
+      rgb(8 8 10 / 0.56);
+    -webkit-backdrop-filter: blur(30px) saturate(150%) brightness(0.9);
+    backdrop-filter: blur(30px) saturate(150%) brightness(0.9);
+  }
+
+  .glass::before,
+  .core::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(
+      140deg,
+      rgb(255 255 255 / 0.55) 0%,
+      rgb(255 255 255 / 0.06) 28%,
+      rgb(255 255 255 / 0) 55%,
+      rgb(255 255 255 / 0.08) 78%,
+      rgb(255 255 255 / 0.32) 100%
+    );
+    -webkit-mask:
+      linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask:
+      linear-gradient(#000 0 0) content-box exclude,
+      linear-gradient(#000 0 0);
+    pointer-events: none;
+  }
+
+  .glass::after,
+  .core::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    background: radial-gradient(110% 60% at 15% -12%, rgb(255 255 255 / 0.16), transparent 58%);
+    pointer-events: none;
+  }
+
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .glass,
+    .glass-deep,
+    .bezel {
+      background: rgb(16 16 18 / 0.9);
+    }
+  }
+
+  /* ─────────────────────────── buttons: island pill + nested icon ("button in button") */
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.9rem;
+    border-radius: 999px;
+    padding: 0.4rem 0.4rem 0.4rem 1.35rem;
+    font-size: 0.875rem;
+    font-weight: 520;
+    letter-spacing: -0.01em;
+    white-space: nowrap;
+    transition:
+      transform 160ms var(--ease-out),
+      background-color 220ms ease,
+      box-shadow 220ms ease;
+  }
+  .btn:active {
+    transform: scale(0.97);
+  }
+  .btn-icon {
+    display: grid;
+    place-items: center;
+    width: 2.15rem;
+    height: 2.15rem;
+    border-radius: 999px;
+    flex: none;
+    transition: transform 420ms var(--ease-out);
+  }
+  .btn-gold {
+    background: var(--color-gold);
+    color: var(--color-ink);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.55),
+      0 12px 28px -14px rgb(0 0 0 / 0.6);
+  }
+  .btn-gold .btn-icon {
+    background: rgb(5 5 5 / 0.1);
+  }
+  .btn-ghost {
+    background: rgb(255 255 255 / 0.07);
+    color: var(--color-cream);
+    box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.14);
+  }
+  .btn-ghost .btn-icon {
+    background: rgb(255 255 255 / 0.1);
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    .btn-gold:hover {
+      background: var(--color-gold-soft);
+    }
+    .btn-ghost:hover {
+      background: rgb(255 255 255 / 0.12);
+    }
+    .btn:hover .btn-icon {
+      transform: translate3d(2px, -1px, 0) scale(1.06);
+    }
+  }
+
+  /* ─────────────────────────── stage */
+
+  .stage-video {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  /* Static grade: vignette + floor/left falloff for type legibility. Painted once, composited forever. */
+  .stage-grade {
+    background:
+      radial-gradient(130% 95% at 50% 42%, transparent 52%, rgb(0 0 0 / 0.5) 100%),
+      linear-gradient(to top, rgb(0 0 0 / 0.6) 0%, rgb(0 0 0 / 0.14) 30%, transparent 50%),
+      linear-gradient(to right, rgb(0 0 0 / 0.28) 0%, transparent 38%),
+      linear-gradient(to bottom, rgb(0 0 0 / 0.38) 0%, transparent 18%);
+  }
+
+  /* Film grain: a static tile shifted in steps — compositor-only, no repaint. */
+  .grain {
+    position: absolute;
+    inset: -50%;
+    background: url('/textures/grain.png') repeat;
+    background-size: 192px;
+    opacity: 0.5;
+    pointer-events: none;
+    animation: grain 0.9s steps(6) infinite;
+  }
+
+  /* Depth planes over the opening and closing summit: two snow layers at different
+     distances. The engine moves the outer element with scroll/pointer; the inner one drifts. */
+  .snow {
+    position: absolute;
+    inset: -1024px 0 0 0;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+  }
+  .snow > i {
+    position: absolute;
+    inset: 0;
+    background-repeat: repeat;
+  }
+  .snow-near > i {
+    background-image: url('/textures/snow-near.png');
+    background-size: 1024px; /* flakes are pre-softened in the texture: no live blur filter */
+    animation: drift-near 26s linear infinite;
+  }
+  .snow-far > i {
+    background-image: url('/textures/snow-far.png');
+    background-size: 512px;
+    animation: drift-far 40s linear infinite;
+  }
+
+  /* Flavor light: the scene's colour spills onto the interface side of the frame. */
+  .tone-light {
+    background:
+      radial-gradient(55% 75% at 0% 55%, color-mix(in srgb, var(--tone) 34%, transparent), transparent 72%),
+      radial-gradient(40% 50% at 8% 100%, color-mix(in srgb, var(--tone) 22%, transparent), transparent 70%);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .caption {
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .film-spacer {
+    height: calc(var(--film-vh) * 1vh);
+    height: calc(var(--film-vh) * 1lvh);
+  }
+
+  .cue-line {
+    animation: cue 2s var(--ease-in-out) infinite;
+  }
+
+  /* ─────────────────────────── scroll reveals for the post-film sections (IntersectionObserver) */
+  .reveal {
+    opacity: 0;
+    transform: translate3d(0, 56px, 0);
+    filter: blur(10px);
+    transition:
+      opacity 1000ms var(--ease-out),
+      transform 1200ms var(--ease-out),
+      filter 900ms var(--ease-out);
+    transition-delay: var(--d, 0ms);
+  }
+  .reveal.is-in {
+    opacity: 1;
+    transform: none;
+    filter: none;
+  }
+
+  .media-zoom {
+    transition: transform 1400ms var(--ease-out);
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .group:hover .media-zoom {
+      transform: scale(1.045);
+    }
+  }
+}
+
+@keyframes grain {
+  0% { transform: translate3d(0, 0, 0); }
+  20% { transform: translate3d(-4%, 3%, 0); }
+  40% { transform: translate3d(3%, -5%, 0); }
+  60% { transform: translate3d(-6%, -2%, 0); }
+  80% { transform: translate3d(5%, 4%, 0); }
+  100% { transform: translate3d(-2%, 6%, 0); }
+}
+
+@keyframes drift-near {
+  from { transform: translate3d(0, 0, 0); }
+  to { transform: translate3d(-64px, 1024px, 0); }
+}
+@keyframes drift-far {
+  from { transform: translate3d(0, 0, 0); }
+  to { transform: translate3d(32px, 512px, 0); }
+}
+
+@keyframes cue {
+  0% { transform: translate3d(0, -100%, 0); }
+  100% { transform: translate3d(0, 200%, 0); }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .glass,
+  .glass-deep,
+  .bezel,
+  .core {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    background: rgb(14 14 16 / 0.96);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cue-line,
+  .grain,
+  .snow > i {
+    animation: none;
+  }
+  .reveal {
+    transform: none;
+    filter: none;
+    transition: opacity 400ms ease;
+  }
+  .media-zoom,
+  .btn,
+  .btn-icon {
+    transition: none;
+  }
+}
