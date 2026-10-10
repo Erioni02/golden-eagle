@@ -26,19 +26,22 @@ type Progress = (loaded: number, total: number) => void
 export async function fetchClip(url: string, onProgress?: Progress, signal?: AbortSignal): Promise<string> {
   const res = await fetch(url, { signal })
   if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} for ${url}`)
-  // Without a progress listener, let the browser assemble the Blob natively: reading chunks in JS
-  // and concatenating them costs ~50 ms of main thread per clip — a dropped frame mid-scroll.
+  // The browser assembles the Blob natively (concatenating chunks in JS costs ~50 ms of main
+  // thread per clip, a dropped frame mid-scroll). For progress, a tee'd copy of the stream is
+  // only counted, never stored.
   if (!onProgress) return URL.createObjectURL(await res.blob())
   const total = Number(res.headers.get('content-length')) || 0
-  const reader = res.body.getReader()
-  const chunks: Uint8Array[] = []
+  const [counted, kept] = res.body.tee()
+  const blob = new Response(kept).blob()
+  const reader = counted.getReader()
   let loaded = 0
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    chunks.push(value)
-    loaded += value.byteLength
-    onProgress?.(loaded, total)
-  }
-  return URL.createObjectURL(new Blob(chunks as BlobPart[], { type: 'video/mp4' }))
+  ;(async () => {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      loaded += value.byteLength
+      onProgress(loaded, total)
+    }
+  })().catch(() => {})
+  return URL.createObjectURL(await blob)
 }

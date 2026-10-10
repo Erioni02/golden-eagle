@@ -8,6 +8,7 @@ import { PartnerBadge } from './components/PartnerBadge'
 import { Loader } from './components/Loader'
 import { Footer } from './components/Footer'
 import { Letterbox } from './components/Letterbox'
+import { NetworkNotice } from './components/NetworkNotice'
 
 export default function App() {
   // One engine for the lifetime of the page. React renders structure; the engine animates it.
@@ -26,6 +27,7 @@ export default function App() {
       <Letterbox engine={engine} />
       <Rail engine={engine} />
       <PartnerBadge engine={engine} />
+      <NetworkNotice engine={engine} />
       <Nav engine={engine} />
       <Loader engine={engine} />
 

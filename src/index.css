@@ -439,6 +439,42 @@
   }
 }
 
+/* Slow-connection notice: drops in under the nav, leaves faster than it arrives. */
+.net-notice {
+  opacity: 0;
+  visibility: hidden;
+  transform: translate3d(0, -10px, 0) scale(0.96);
+  transition:
+    opacity 200ms ease,
+    transform 200ms ease,
+    visibility 0s linear 200ms;
+}
+.net-notice[data-on='true'] {
+  opacity: 1;
+  visibility: visible;
+  transform: none;
+  transition:
+    opacity 320ms var(--ease-out),
+    transform 480ms var(--ease-out),
+    visibility 0s;
+}
+.net-notice[data-on='true'] .net-icon {
+  animation: net-pulse 1.6s ease-in-out infinite;
+}
+@keyframes net-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .net-notice,
+  .net-notice[data-on='true'] {
+    transform: none;
+  }
+  .net-notice[data-on='true'] .net-icon {
+    animation: none;
+  }
+}
+
 @keyframes grain {
   0% { transform: translate3d(0, 0, 0); }
   20% { transform: translate3d(-4%, 3%, 0); }

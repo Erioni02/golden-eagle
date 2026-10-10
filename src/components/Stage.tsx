@@ -37,6 +37,8 @@ export const Stage = memo(function Stage({ engine }: { engine: FilmEngine }) {
           )
         })}
       </div>
+      {/* fallback still: shown only while the scene on screen has no decoded video frame yet */}
+      {!engine.reduced && <img ref={engine.registerFallback} className="stage-video stage-still" alt="" decoding="async" />}
       <div className="stage-grade absolute inset-0" />
       {/* depth planes: far flakes, then near (out-of-focus) flakes in front of the footage */}
       <div ref={(el) => engine.registerSnow('far', el)} className="snow snow-far">
