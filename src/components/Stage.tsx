@@ -5,7 +5,7 @@ import { posterUrl } from '../film/media'
 /** Fixed full-screen layer stack: one <video> per scene (or one still per scene in reduced motion). */
 export const Stage = memo(function Stage({ engine }: { engine: FilmEngine }) {
   return (
-    <div className="fixed inset-0 z-0 overflow-hidden bg-ink" aria-hidden="true">
+    <div ref={engine.registerStageRoot} className="fixed inset-0 z-0 overflow-hidden bg-ink" aria-hidden="true">
       <div ref={engine.registerStage} className="absolute inset-0 will-change-transform">
         {engine.scenes.map((s, i) => {
           const objectPosition = `${(s.focusX ?? 0.5) * 100}% 50%`

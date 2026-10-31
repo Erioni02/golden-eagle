@@ -95,13 +95,17 @@ The "AI generated" text is removed in the encode (ffmpeg `delogo` plus a feather
 - **The screen is never empty.** A clip is only shown once it has decoded a frame. Until then the engine holds the neighbouring clip's matching boundary frame, or the scene's poster still (posters are pre-decoded and swapped in as elements, so they never blank).
 - **Outrunning the downloads degrades to streaming, not black.** If the scene on screen hasn't downloaded yet (and won't land within ~1.5 s, judged from live download progress), it streams immediately with priority: its duplicate download is cancelled and background prefetches pause until it shows a frame. Downloads of clips already scrolled past are cancelled. The next scene pre-streams only once the current one is satisfied.
 - **Slow connections are named, not hidden.** If the scene on screen has waited on the network for 0.9 s, a small glass notice under the nav says "Your connection is slow" with the download progress (`NetworkNotice.tsx`). It clears once footage has flowed for 2 s, never shows on a good line, and is announced once to screen readers.
-- **No more than five `<video>` elements hold a source at once,** to keep decoder memory in check, which matters on iOS.
+- **No more than five `<video>` elements hold a source at once on phones and iOS,** to keep decoder memory in check. On desktop-class devices every downloaded clip stays attached instead: attaching or detaching a source spins a hardware decoder up or down and stalls the compositor for 100–180 ms, so it happens once per clip, only while the viewer is at rest, and never at a scene boundary mid-scroll.
+- **GPU warm-up under the loader.** Every glass card and the flavor light are composited once at near-zero opacity while the loader is up. The first backdrop-blur draw otherwise costs a 250 ms+ stall, which used to land on the first flavor.
+- **Nothing is drawn behind the footer.** Once the range section fills the viewport, the film layers drop to opacity 0 and the compositor skips them (no decoder teardown, so coming back up is instant). Footer reveals animate only `opacity` and `transform`.
 - **Clips use a short keyframe interval with no B-frames,** so a random seek decodes at most 7 frames (the raw files had one keyframe per clip).
 - **Captions animate only `opacity` and `transform`,** and each value is written only when it changes. React never re-renders per frame.
 - **Liquid glass (`backdrop-filter`) is limited to small surfaces:** the nav, badge and cards.
 - `prefers-reduced-motion` shows still frames per scene with no video downloads, and captions don't move.
 
 Measured on a production build with headless Chrome while scrubbing: about 0.4 ms of script and 0.4 ms of style work per frame, layout close to zero, no long tasks, and a 2.2 MB JS heap.
+
+Whole-film scroll test (production build, Chrome, 1440×900, forward and back at 1800 px/s plus a slow 700 px/s pass): 1 dropped frame out of about 7,000, worst frame 33 ms. Before the decoder and warm-up changes the slow pass alone dropped 65 frames with stalls up to 350 ms.
 
 ## Hosting the clips on a CDN
 

@@ -78,6 +78,14 @@ export class FilmEngine {
   /** Desktop (1080p) or mobile (720p) clips. Drops to 720p for the rest of the visit on a slow line. */
   variant: Variant = pickVariant()
   readonly reduced = matchMedia('(prefers-reduced-motion: reduce)').matches
+  /**
+   * Desktop-class device with decoder headroom: every downloaded clip stays attached. Attaching or
+   * detaching a <video> source spins a hardware decoder up / down, which stalls the compositor for
+   * 100–180 ms. Doing that at a scene boundary mid-scroll is a visible hitch, so on these devices it
+   * happens once per clip, while the viewer is at rest, and never again.
+   */
+  private readonly roomy =
+    !IS_IOS && this.variant === 'desktop' && ((navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8) >= 4
 
   /** Total film length in viewport heights (scroll distance mapped to footage). */
   readonly totalVh = SCENES.reduce((sum, s) => sum + (s.frames / FPS) * VH_PER_SECOND + s.holdVh, 0)
@@ -86,6 +94,10 @@ export class FilmEngine {
   private stills: HTMLElement[] = []
   private captionEls = new Map<string, HTMLElement>()
   private stage: HTMLElement | null = null
+  private stageRoot: HTMLElement | null = null
+  /** Scroll px where the footer's top edge reaches the top of the viewport. */
+  private footerTop = Infinity
+  private covered = false
   private fallback: HTMLImageElement | null = null
   /** What is actually visible: a scene's video layer index, or -1 for the poster still. */
   private shown = -2
@@ -211,6 +223,8 @@ export class FilmEngine {
   /** Poster still shown when the scene on screen has no decoded video frame yet. */
   registerFallback = (el: HTMLImageElement | null) => (this.fallback = el)
   registerStage = (el: HTMLElement | null) => (this.stage = el)
+  /** The whole fixed film layer stack (videos, grade, snow, grain): dropped from compositing under the footer. */
+  registerStageRoot = (el: HTMLElement | null) => (this.stageRoot = el)
   registerRail = (el: HTMLElement | null) => (this.rail = el)
   registerSpacer = (el: HTMLElement | null) => (this.spacer = el)
   registerBadge = (el: HTMLElement | null) => {
@@ -262,6 +276,7 @@ export class FilmEngine {
     if (this.reduced) {
       this.setLoad(1, true)
     } else {
+      this.warmLayers()
       this.pumpLoads()
       // Don't hold the intro hostage on slow networks: after 6 s, stream instead.
       this.readyTimer = window.setTimeout(() => {
@@ -289,6 +304,9 @@ export class FilmEngine {
     clearTimeout(this.readyTimer)
     clearTimeout(this.slowTimer)
     clearTimeout(this.hideTimer)
+    clearTimeout(this.warmTimer)
+    this.warmTimer = 0
+    this.warming = -1
     this.waitSince = 0
     this.slow = false
     this.running = false
@@ -313,14 +331,55 @@ export class FilmEngine {
     this.shown = -2
   }
 
+  /**
+   * Shader / raster warm-up, under the loader. The first time a glass card (backdrop blur), the
+   * or the flavor light composites, the GPU builds its pipeline: a 250 ms+ stall that
+   * otherwise lands mid-scroll on the first flavor. Every such layer is drawn once, practically
+   * invisible, then handed back to the engine.
+   */
+  private warmLayers() {
+    const els = [...this.captionEls.values(), this.toneLayer].filter((el): el is HTMLElement => !!el)
+    const saved = els.map((el) => [el.style.visibility, el.style.opacity] as const)
+    els.forEach((el) => {
+      el.style.visibility = 'visible'
+      el.style.opacity = '0.004'
+    })
+    this.warmingLayers = true
+    window.setTimeout(() => {
+      if (!this.mounted) return
+      els.forEach((el, k) => {
+        el.style.visibility = saved[k][0]
+        el.style.opacity = saved[k][1]
+      })
+      this.warmingLayers = false
+      // forget the cached styles so the next frame writes the real values
+      this.captions.forEach((c) => {
+        c.o = -1
+        c.shown = c.el.style.visibility === 'visible'
+      })
+      this.toneO = -1
+      this.wake()
+    }, 700)
+  }
+  private warmingLayers = false
+
   // ───────────────────────────── input (cheap: store + wake)
 
   private onScroll = () => {
     this.targetY = window.scrollY
+    this.lastInput = performance.now()
     this.wake()
   }
-  private onTouch = () => (this.stiffness = 11) // touch already has native momentum — follow it closely
-  private onWheel = () => (this.stiffness = 6) // wheel steps are coarse — ease them into a glide
+  // touch already has native momentum — follow it closely
+  private onTouch = () => {
+    this.stiffness = 11
+    this.lastInput = performance.now()
+  }
+  // wheel steps are coarse — ease them into a glide
+  private onWheel = () => {
+    this.stiffness = 6
+    this.lastInput = performance.now()
+  }
   private onPointer = (e: PointerEvent) => {
     this.ptrTarget.x = (e.clientX / this.vw) * 2 - 1
     this.ptrTarget.y = (e.clientY / this.vh) * 2 - 1
@@ -356,6 +415,7 @@ export class FilmEngine {
     // stable on mobile when the browser chrome shows/hides.
     const spacerH = this.spacer?.offsetHeight ?? this.vh * (this.totalVh + 100) / 100
     const unit = spacerH / (this.totalVh + 100)
+    this.footerTop = spacerH
 
     let y = 0
     this.scenes.forEach((s, i) => {
@@ -466,12 +526,29 @@ export class FilmEngine {
     const ptrMoving = Math.abs(this.ptrTarget.x - this.ptr.x) + Math.abs(this.ptrTarget.y - this.ptr.y) > 0.002
 
     const settledVideo = this.render(this.smoothY, ts)
+    this.coverCheck()
 
     if (this.smoothY !== this.targetY || !settledVideo || ptrMoving) {
       this.raf = requestAnimationFrame(this.tick)
     } else {
       this.running = false // sleep until next scroll / seeked event
     }
+  }
+
+  /**
+   * Once the footer fills the viewport, the film layers behind it stop being composited at all:
+   * 13 full-screen videos, a moving grain plate and glass cards would otherwise be drawn under an
+   * opaque page every frame while the visitor browses the range.
+   */
+  private coverCheck() {
+    const covered = this.targetY >= this.footerTop + 2
+    if (covered === this.covered) return
+    this.covered = covered
+    // opacity, not visibility: children that set visibility: visible would still be drawn, and a
+    // transparent layer is skipped by the compositor without tearing down any video decoder
+    const o = covered ? '0' : ''
+    if (this.stageRoot) this.stageRoot.style.opacity = o
+    if (this.captionLayer) this.captionLayer.style.opacity = o
   }
 
   /** Applies a film position to the DOM. Returns true when everything shows its final state. */
@@ -594,7 +671,7 @@ export class FilmEngine {
     // flavor light: rises as the can lands, holds, then dims before the next transformation
     const isFlavor = this.scenes[i].captions.some((c) => c.layout === 'flavor')
     const tone = isFlavor ? Math.round(clamp01((p - 0.72) / 0.28) * (1 - clamp01((h - 0.78) / 0.22)) * 100) / 100 : 0
-    if (tone !== this.toneO && this.toneLayer) {
+    if (tone !== this.toneO && this.toneLayer && !this.warmingLayers) {
       this.toneO = tone
       this.toneLayer.style.opacity = String(tone)
     }
@@ -691,11 +768,45 @@ export class FilmEngine {
   private updateWindow(i: number) {
     this.clips.forEach((c, k) => {
       const want = k >= i - 1 && k <= i + 2
-      const keep = k >= i - 2 && k <= i + 3 // hysteresis so scrolling back and forth doesn't thrash
+      const keep = this.roomy || (k >= i - 2 && k <= i + 3) // hysteresis so scrolling back and forth doesn't thrash
       if (want) this.attach(k)
       else if (!keep && c.attachedUrl && k !== this.shown) this.detach(k)
     })
+    this.scheduleWarm()
   }
+
+  /**
+   * Roomy devices: attaches downloaded clips outside the decode window ahead of time, one at a
+   * time and only while the viewer is at rest (reading the intro, pausing on a flavor), so the
+   * decoder spin-up never lands mid-scroll.
+   */
+  private scheduleWarm() {
+    if (!this.roomy || this.warmTimer || !this.mounted) return
+    this.warmTimer = window.setTimeout(() => {
+      this.warmTimer = 0
+      if (!this.mounted) return
+      // one decoder spin-up at a time (a clip that never decodes is given up on after 3 s)
+      if (this.warming >= 0 && !this.clips[this.warming].hasFrame && performance.now() - this.warmSince < 3000) return this.scheduleWarm()
+      this.warming = -1
+      const calm = performance.now() - this.lastInput > 350 && Math.abs(this.targetY - this.smoothY) < 1
+      if (!calm) return this.scheduleWarm()
+      const from = Math.max(this.active, 0)
+      let best = -1
+      this.clips.forEach((c, k) => {
+        if (!c.blobUrl || c.attachedUrl) return
+        if (best < 0 || Math.abs(k - from) + (k < from ? 0.5 : 0) < Math.abs(best - from) + (best < from ? 0.5 : 0)) best = k
+      })
+      if (best < 0) return // everything downloaded is warm; a landing download re-schedules
+      this.warming = best
+      this.warmSince = performance.now()
+      this.attach(best)
+      this.scheduleWarm()
+    }, 220)
+  }
+  private warmTimer = 0
+  private warming = -1
+  private warmSince = 0
+  private lastInput = 0
 
   private attach(k: number) {
     const c = this.clips[k]
@@ -1039,6 +1150,7 @@ export class FilmEngine {
         this.measureSpeed(c)
         // attach now if it's inside the decode window (upgrades an off-screen streamed source too)
         if (k >= this.active - 1 && k <= this.active + 2) this.attach(k)
+        else this.scheduleWarm()
         if (k === 0) this.setLoad(1, true)
       })
       .catch(() => {

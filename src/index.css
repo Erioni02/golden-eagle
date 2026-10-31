@@ -413,20 +413,18 @@
   }
 
   /* ─────────────────────────── scroll reveals for the post-film sections (IntersectionObserver) */
+  /* opacity + transform only: a blur() reveal repaints every tile on every frame of its entrance */
   .reveal {
     opacity: 0;
     transform: translate3d(0, 56px, 0);
-    filter: blur(10px);
     transition:
       opacity 1000ms var(--ease-out),
-      transform 1200ms var(--ease-out),
-      filter 900ms var(--ease-out);
+      transform 1200ms var(--ease-out);
     transition-delay: var(--d, 0ms);
   }
   .reveal.is-in {
     opacity: 1;
     transform: none;
-    filter: none;
   }
 
   .media-zoom {
@@ -517,7 +515,6 @@
   }
   .reveal {
     transform: none;
-    filter: none;
     transition: opacity 400ms ease;
   }
   .media-zoom,
