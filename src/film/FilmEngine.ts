@@ -578,8 +578,10 @@ export class FilmEngine {
       const frames = this.clips[i].frames
       settled = this.seek(i, Math.round(p * (frames - 1)))
       // keep neighbours parked on their boundary frames so the hand-off is instant in either direction
-      if (i + 1 < this.scenes.length) this.seek(i + 1, 0)
-      if (i > 0) this.seek(i - 1, this.clips[i - 1].frames - 1)
+      // Never seek a visible outgoing layer in the background: some browsers clear it to black
+      // for the duration of the seek, exactly when it is serving as the transition hold frame.
+      if (i + 1 < this.scenes.length && i + 1 !== this.shown) this.seek(i + 1, 0)
+      if (i > 0 && i - 1 !== this.shown) this.seek(i - 1, this.clips[i - 1].frames - 1)
       this.present(i, p)
     }
 
@@ -851,7 +853,9 @@ export class FilmEngine {
   private onClipData(k: number) {
     const v = this.videos[k]
     const c = this.clips[k]
-    if (c.attachedUrl && v.readyState >= 2) c.hasFrame = true
+    // loadeddata can arrive for the old frame while a large seek is still in flight. Only
+    // seeked (or a non-seeking loadeddata) makes this clip safe to put back on screen.
+    if (c.attachedUrl && v.readyState >= 2 && !v.seeking) c.hasFrame = true
     if (k === this.streaming && c.hasFrame) {
       this.streaming = -1
       this.pumpLoads()
@@ -898,15 +902,7 @@ export class FilmEngine {
       }
       // Swap in the already-decoded image element itself. Re-pointing a visible <img> at a URL
       // can blank it while the browser re-requests (e.g. cache disabled / evicted).
-      if (this.fallback && src !== this.fallbackSrc) {
-        img.className = this.fallback.className
-        img.alt = ''
-        img.style.objectPosition = `${(this.scenes[i].focusX ?? 0.5) * 100}% 50%`
-        img.style.opacity = this.fallback.style.opacity || '0'
-        this.fallback.replaceWith(img)
-        this.fallback = img
-        this.fallbackSrc = src
-      }
+      this.usePoster(i, p < 0.5 ? 'first' : 'last')
     }
     if (target === this.shown) return
     // reveal the incoming layer before hiding the outgoing one, so nothing empty is ever composited
@@ -916,6 +912,20 @@ export class FilmEngine {
     if (this.shown >= 0) this.videos[this.shown].style.opacity = '0'
     else if (this.shown === -1 && this.fallback) this.fallback.style.opacity = '0'
     this.shown = target
+  }
+
+  /** Point the persistent still layer at an already-decoded poster. */
+  private usePoster(i: number, side: 'first' | 'last') {
+    const src = posterUrl(this.scenes[i].file, side)
+    const img = this.posterImgs.get(src)
+    if (!img || !this.fallback || src === this.fallbackSrc) return
+    img.className = this.fallback.className
+    img.alt = ''
+    img.style.objectPosition = `${(this.scenes[i].focusX ?? 0.5) * 100}% 50%`
+    img.style.opacity = this.fallback.style.opacity || '0'
+    this.fallback.replaceWith(img)
+    this.fallback = img
+    this.fallbackSrc = src
   }
 
   /**
@@ -1077,10 +1087,33 @@ export class FilmEngine {
     if (!v || !c.attachedUrl || v.readyState < 1) return true
     if (v.seeking) return false
     if (c.requested === frame) return true
-    c.requested = frame
     // aim for the middle of the frame so float rounding never lands on the neighbour
     const t = Math.min((frame + 0.5) / FPS, v.duration - 0.001)
-    if (Math.abs(v.currentTime - t) > 0.5 / FPS) v.currentTime = t
+    const distance = Math.abs(v.currentTime - t)
+    if (distance > 0.5 / FPS) {
+      // Browsers may clear a video layer while decoding a distant seek. Keep the last good
+      // picture/poster visible until seeked confirms that the destination frame is decoded.
+      if (k === this.active && distance > 0.2) {
+        // If this is the currently visible layer, let its poster decode before starting the seek.
+        if (k === this.shown) {
+          const side = frame < c.frames / 2 ? 'first' : 'last'
+          const still = posterUrl(this.scenes[k].file, side)
+          if (!this.posterImgs.has(still)) {
+            this.preloadPoster(still)
+            return false
+          }
+          this.usePoster(k, side)
+          if (this.fallback) this.fallback.style.opacity = '1'
+          v.style.opacity = '0'
+          this.shown = -1
+        }
+        c.hasFrame = false
+      }
+      c.requested = frame
+      v.currentTime = t
+    } else {
+      c.requested = frame
+    }
     return false
   }
 
