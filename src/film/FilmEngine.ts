@@ -31,6 +31,9 @@ type ClipState = {
   frames: number
   /** The element has decoded at least one frame of its current source (safe to show). */
   hasFrame: boolean
+  /** An iOS seek is not display-ready until Safari reports the frame presented. */
+  awaitingFrame: boolean
+  frameCheckPending: boolean
   /** Cancels this clip's download (when the viewer has already scrolled past it). */
   fetchAbort: AbortController | null
   /** Pending "stream it if the download hasn't landed" timer. */
@@ -100,6 +103,8 @@ export class FilmEngine {
   private footerTop = Infinity
   private covered = false
   private fallback: HTMLImageElement | null = null
+  private holdLayer: HTMLCanvasElement | null = null
+  private holdingFrame = false
   /** What is actually visible: a scene's video layer index, or -1 for the poster still. */
   private shown = -2
   private fallbackSrc = ''
@@ -147,6 +152,8 @@ export class FilmEngine {
     requested: -1,
     frames: s.frames,
     hasFrame: false,
+    awaitingFrame: false,
+    frameCheckPending: false,
     fetchAbort: null,
     graceTimer: 0,
     loaded: 0,
@@ -224,6 +231,7 @@ export class FilmEngine {
   registerCaptionLayer = (el: HTMLElement | null) => (this.captionLayer = el)
   /** Poster still shown when the scene on screen has no decoded video frame yet. */
   registerFallback = (el: HTMLImageElement | null) => (this.fallback = el)
+  registerHoldFrame = (el: HTMLCanvasElement | null) => (this.holdLayer = el)
   registerStage = (el: HTMLElement | null) => (this.stage = el)
   /** The whole fixed film layer stack (videos, grade, snow, grain): dropped from compositing under the footer. */
   registerStageRoot = (el: HTMLElement | null) => (this.stageRoot = el)
@@ -321,6 +329,8 @@ export class FilmEngine {
       c.fetching = false
       c.fetchAbort = null
       c.hasFrame = false
+      c.awaitingFrame = false
+      c.frameCheckPending = false
       c.requested = -1
       const v = this.videos[i]
       if (v) {
@@ -331,6 +341,8 @@ export class FilmEngine {
     this.inflight = 0
     this.active = -1
     this.shown = -2
+    this.holdingFrame = false
+    if (this.holdLayer) this.holdLayer.style.opacity = '0'
   }
 
   /**
@@ -839,6 +851,8 @@ export class FilmEngine {
     c.primed = false
     c.priming = false
     c.hasFrame = false
+    c.awaitingFrame = false
+    c.frameCheckPending = false
     // posters are assigned lazily so 13 images aren't fetched up front
     if (!v.getAttribute('poster')) v.poster = posterUrl(this.scenes[k].file, 'first')
     v.src = url
@@ -851,6 +865,8 @@ export class FilmEngine {
     c.attachedUrl = null
     c.requested = -1
     c.hasFrame = false
+    c.awaitingFrame = false
+    c.frameCheckPending = false
     c.primed = false
     c.priming = false
     if (!v) return
@@ -863,11 +879,16 @@ export class FilmEngine {
     const c = this.clips[k]
     // loadeddata can arrive for the old frame while a large seek is still in flight. Only
     // seeked (or a non-seeking loadeddata) makes this clip safe to put back on screen.
-    if (IS_IOS && !c.primed) {
+    if (c.awaitingFrame) {
+      this.confirmPresentedFrame(k)
+    } else if (IS_IOS && !c.primed) {
       // Never expose an iOS video surface until its muted play/pause priming has completed.
       c.hasFrame = false
       this.primeClip(k)
-    } else if (c.attachedUrl && v.readyState >= 2 && !v.seeking) c.hasFrame = true
+    } else if (c.attachedUrl && v.readyState >= 2 && !v.seeking) {
+      c.hasFrame = true
+      this.restoreHeldFrame(k)
+    }
     if (k === this.streaming && c.hasFrame) {
       this.streaming = -1
       this.pumpLoads()
@@ -890,12 +911,79 @@ export class FilmEngine {
         c.primed = true
         c.requested = -1
         c.hasFrame = c.attachedUrl !== null && v.readyState >= 2 && !v.seeking
+        this.resumeLoadsAfterFrame(k, c.hasFrame)
         this.wake()
       })
       .catch(() => {
         c.priming = false
         // Keep the poster visible; a later touchstart retries play() with a user gesture.
       })
+  }
+
+  /** Confirm the destination frame actually reached the compositor before showing it on iOS. */
+  private confirmPresentedFrame(k: number) {
+    const v = this.videos[k]
+    const c = this.clips[k]
+    if (!c?.awaitingFrame || c.frameCheckPending || !v || v.seeking) return
+    if (!v.requestVideoFrameCallback) {
+      // Older Safari has no presentation callback; seeked is its best available signal.
+      c.awaitingFrame = false
+      c.hasFrame = !!c.attachedUrl && v.readyState >= 2
+      this.restoreHeldFrame(k)
+      this.resumeLoadsAfterFrame(k, c.hasFrame)
+      this.wake()
+      return
+    }
+    c.frameCheckPending = true
+    v.requestVideoFrameCallback((_now, metadata) => {
+      c.frameCheckPending = false
+      if (!c.attachedUrl || !c.awaitingFrame) return
+      const expected = (c.requested + 0.5) / FPS
+      const matchesTarget = c.requested < 0 || Math.abs(metadata.mediaTime - expected) <= 2 / FPS
+      if (!v.seeking && v.readyState >= 2 && matchesTarget) {
+        c.awaitingFrame = false
+        c.hasFrame = true
+        this.restoreHeldFrame(k)
+        this.resumeLoadsAfterFrame(k, true)
+        this.wake()
+      } else {
+        this.confirmPresentedFrame(k)
+      }
+    })
+  }
+
+  /** Keep a decoded frame above the video surface while iOS clears it during a long seek. */
+  private holdDecodedFrame(k: number, v: HTMLVideoElement) {
+    const canvas = this.holdLayer
+    if (!canvas || v.readyState < 2 || !v.videoWidth || !v.videoHeight) return false
+    try {
+      if (canvas.width !== v.videoWidth) canvas.width = v.videoWidth
+      if (canvas.height !== v.videoHeight) canvas.height = v.videoHeight
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return false
+      ctx.drawImage(v, 0, 0, canvas.width, canvas.height)
+      canvas.style.objectPosition = v.style.objectPosition
+      canvas.style.opacity = '1'
+      v.style.opacity = '0'
+      this.holdingFrame = true
+      this.shown = k
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  private restoreHeldFrame(k: number) {
+    if (!this.holdingFrame || k !== this.shown) return
+    if (this.holdLayer) this.holdLayer.style.opacity = '0'
+    this.videos[k].style.opacity = '1'
+    this.holdingFrame = false
+  }
+
+  private resumeLoadsAfterFrame(k: number, ready: boolean) {
+    if (!ready || k !== this.streaming) return
+    this.streaming = -1
+    this.pumpLoads()
   }
 
   /**
@@ -906,7 +994,11 @@ export class FilmEngine {
    *   · otherwise show the scene's poster still (first or last frame, whichever is closer).
    */
   private present(i: number, p: number) {
-    const ready = (k: number) => k >= 0 && k < this.clips.length && !!this.clips[k].attachedUrl && this.clips[k].hasFrame
+    const ready = (k: number) =>
+      k >= 0 &&
+      k < this.clips.length &&
+      !!this.clips[k].attachedUrl &&
+      (this.clips[k].hasFrame || (this.holdingFrame && k === this.shown))
     let target: number
     if (ready(i)) target = i
     else if (this.shown === i - 1 && ready(i - 1) && p < 0.3) target = i - 1
@@ -934,6 +1026,10 @@ export class FilmEngine {
     } else this.videos[target].style.opacity = '1'
     if (this.shown >= 0) this.videos[this.shown].style.opacity = '0'
     else if (this.shown === -1 && this.fallback) this.fallback.style.opacity = '0'
+    if (this.holdingFrame && this.holdLayer) {
+      this.holdLayer.style.opacity = '0'
+      this.holdingFrame = false
+    }
     this.shown = target
   }
 
@@ -1119,18 +1215,22 @@ export class FilmEngine {
       if (k === this.active && distance > 0.2) {
         // If this is the currently visible layer, let its poster decode before starting the seek.
         if (k === this.shown) {
-          const side = frame < c.frames / 2 ? 'first' : 'last'
-          const still = posterUrl(this.scenes[k].file, side)
-          if (!this.posterImgs.has(still)) {
-            this.preloadPoster(still)
-            return false
+          const held = IS_IOS && this.holdDecodedFrame(k, v)
+          if (!held) {
+            const side = frame < c.frames / 2 ? 'first' : 'last'
+            const still = posterUrl(this.scenes[k].file, side)
+            if (!this.posterImgs.has(still)) {
+              this.preloadPoster(still)
+              return false
+            }
+            this.usePoster(k, side)
+            if (this.fallback) this.fallback.style.opacity = '1'
+            v.style.opacity = '0'
+            this.shown = -1
           }
-          this.usePoster(k, side)
-          if (this.fallback) this.fallback.style.opacity = '1'
-          v.style.opacity = '0'
-          this.shown = -1
         }
         c.hasFrame = false
+        if (IS_IOS) c.awaitingFrame = true
       }
       c.requested = frame
       v.currentTime = t

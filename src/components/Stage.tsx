@@ -39,6 +39,8 @@ export const Stage = memo(function Stage({ engine }: { engine: FilmEngine }) {
       </div>
       {/* fallback still: shown only while the scene on screen has no decoded video frame yet */}
       {!engine.reduced && <img ref={engine.registerFallback} className="stage-video stage-still" alt="" decoding="async" />}
+      {/* Holds the last decoded iPhone frame while Safari resolves a large scrub seek. */}
+      {!engine.reduced && <canvas ref={engine.registerHoldFrame} className="stage-video stage-hold" aria-hidden="true" />}
       <div className="stage-grade absolute inset-0" />
       {/* depth planes: far flakes, then near (out-of-focus) flakes in front of the footage */}
       <div ref={(el) => engine.registerSnow('far', el)} className="snow snow-far">

@@ -342,6 +342,9 @@
     opacity: 0;
     pointer-events: none;
   }
+  .stage-hold {
+    opacity: 0;
+  }
 
   /* Static grade: vignette + floor/left falloff for type legibility. Painted once, composited forever. */
   .stage-grade {
