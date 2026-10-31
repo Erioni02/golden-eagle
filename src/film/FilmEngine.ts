@@ -23,6 +23,7 @@ type ClipState = {
   fetching: boolean
   failed: boolean
   primed: boolean
+  priming: boolean
   /** Download is taking too long for the scene on screen — stream it meanwhile. */
   streamFallback: boolean
   /** Last frame we asked the decoder for (-1 = unknown). */
@@ -141,6 +142,7 @@ export class FilmEngine {
     fetching: false,
     failed: false,
     primed: false,
+    priming: false,
     streamFallback: false,
     requested: -1,
     frames: s.frames,
@@ -375,6 +377,8 @@ export class FilmEngine {
     // Keep the film close to native touch momentum; a slow catch-up reads as judder on phones.
     this.stiffness = 15
     this.lastInput = performance.now()
+    // Retry the muted iOS decoder unlock inside a real touch gesture if autoplay was refused.
+    if (IS_IOS && this.active >= 0) this.primeClip(this.active)
   }
   // wheel steps are coarse — ease them into a glide
   private onWheel = () => {
@@ -586,7 +590,8 @@ export class FilmEngine {
     }
 
     // Hold "breathing": a slow push-in and back while the clip rests on its hero frame.
-    const scale = h > 0 && !this.reduced ? 1 + 0.028 * Math.sin(Math.PI * h) : 1
+    // The slow push-in is intentional on desktop; on iPhone it reads as an unwanted zoom.
+    const scale = h > 0 && !this.reduced && !IS_IOS ? 1 + 0.028 * Math.sin(Math.PI * h) : 1
     if (this.stage && Math.abs(scale - this.stageScale) > 0.0002) {
       this.stageScale = scale
       this.stage.style.transform = scale === 1 ? '' : `scale3d(${scale.toFixed(4)},${scale.toFixed(4)},1)`
@@ -832,6 +837,7 @@ export class FilmEngine {
     c.attachedUrl = url
     c.requested = -1
     c.primed = false
+    c.priming = false
     c.hasFrame = false
     // posters are assigned lazily so 13 images aren't fetched up front
     if (!v.getAttribute('poster')) v.poster = posterUrl(this.scenes[k].file, 'first')
@@ -845,6 +851,8 @@ export class FilmEngine {
     c.attachedUrl = null
     c.requested = -1
     c.hasFrame = false
+    c.primed = false
+    c.priming = false
     if (!v) return
     v.removeAttribute('src')
     v.load()
@@ -855,24 +863,39 @@ export class FilmEngine {
     const c = this.clips[k]
     // loadeddata can arrive for the old frame while a large seek is still in flight. Only
     // seeked (or a non-seeking loadeddata) makes this clip safe to put back on screen.
-    if (c.attachedUrl && v.readyState >= 2 && !v.seeking) c.hasFrame = true
+    if (IS_IOS && !c.primed) {
+      // Never expose an iOS video surface until its muted play/pause priming has completed.
+      c.hasFrame = false
+      this.primeClip(k)
+    } else if (c.attachedUrl && v.readyState >= 2 && !v.seeking) c.hasFrame = true
     if (k === this.streaming && c.hasFrame) {
       this.streaming = -1
       this.pumpLoads()
     }
     if (Number.isFinite(v.duration) && v.duration > 0) c.frames = Math.max(1, Math.round(v.duration * FPS))
-    if (IS_IOS && !c.primed) {
-      // iOS Safari won't paint seeked frames of a never-played video. A muted play/pause unlocks it.
-      c.primed = true
-      v.play()
-        .then(() => {
-          v.pause()
-          c.requested = -1
-          this.wake()
-        })
-        .catch(() => {})
-    }
     this.wake()
+  }
+
+  /** iOS Safari may report decoded data before it will paint a seeked frame. */
+  private primeClip(k: number) {
+    const v = this.videos[k]
+    const c = this.clips[k]
+    if (!IS_IOS || !v || !c?.attachedUrl || c.primed || c.priming || v.readyState < 2) return
+    c.priming = true
+    c.hasFrame = false
+    v.play()
+      .then(() => {
+        v.pause()
+        c.priming = false
+        c.primed = true
+        c.requested = -1
+        c.hasFrame = c.attachedUrl !== null && v.readyState >= 2 && !v.seeking
+        this.wake()
+      })
+      .catch(() => {
+        c.priming = false
+        // Keep the poster visible; a later touchstart retries play() with a user gesture.
+      })
   }
 
   /**
