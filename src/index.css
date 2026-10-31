@@ -352,15 +352,14 @@
       linear-gradient(to bottom, rgb(0 0 0 / 0.38) 0%, transparent 18%);
   }
 
-  /* Film grain: a static tile shifted in steps — compositor-only, no repaint. */
+  /* Fine film grain stays static so the full-screen overlay does not animate during scrubbing. */
   .grain {
     position: absolute;
     inset: -50%;
     background: url('/textures/grain.png') repeat;
     background-size: 192px;
-    opacity: 0.5;
+    opacity: 0.24;
     pointer-events: none;
-    animation: grain 0.9s steps(6) infinite;
   }
 
   /* Depth planes over the opening and closing summit: two snow layers at different
@@ -376,6 +375,7 @@
     position: absolute;
     inset: 0;
     background-repeat: repeat;
+    animation-play-state: paused;
   }
   .snow-near > i {
     background-image: url('/textures/snow-near.png');

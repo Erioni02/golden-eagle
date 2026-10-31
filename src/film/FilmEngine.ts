@@ -372,12 +372,14 @@ export class FilmEngine {
   }
   // touch already has native momentum — follow it closely
   private onTouch = () => {
-    this.stiffness = 11
+    // Keep the film close to native touch momentum; a slow catch-up reads as judder on phones.
+    this.stiffness = 15
     this.lastInput = performance.now()
   }
   // wheel steps are coarse — ease them into a glide
   private onWheel = () => {
-    this.stiffness = 6
+    // A shorter easing tail makes scrubbed footage respond immediately while retaining glide.
+    this.stiffness = 12
     this.lastInput = performance.now()
   }
   private onPointer = (e: PointerEvent) => {
@@ -649,6 +651,10 @@ export class FilmEngine {
       st.o = snow
       this.snowNear.style.opacity = this.snowFar.style.opacity = String(snow)
       this.snowNear.style.visibility = this.snowFar.style.visibility = snow > 0 ? 'visible' : 'hidden'
+      // These full-screen texture animations are only useful over the two mountain scenes.
+      const playState = snow > 0 ? 'running' : 'paused'
+      this.snowNear.firstElementChild instanceof HTMLElement && (this.snowNear.firstElementChild.style.animationPlayState = playState)
+      this.snowFar.firstElementChild instanceof HTMLElement && (this.snowFar.firstElementChild.style.animationPlayState = playState)
     }
     if (snow > 0 && this.snowNear && this.snowFar && !this.reduced) {
       // near flakes travel faster than far ones: parallax depth from one scroll input
