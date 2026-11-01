@@ -56,63 +56,52 @@ Tested at 320×568, 390×844, 430×932, 844×390, 768×1024, 820×1180, 1024×76
 |---|---|
 | `src/film/scenes.ts` | **The film as data**: clip order, hold lengths, chapter names, all captions and flavor copy. Edit text here. |
 | `src/film/FilmEngine.ts` | Scroll → video engine (single rAF loop, seeking, captions, decode window, loading) |
-| `src/film/media.ts` | Clip URLs, desktop/mobile variant choice, Blob download with progress |
+| `src/film/media.ts` | Mux HLS stream URLs and local poster paths |
 | `src/components/*` | Stage (videos, snow planes, flavor light, grain), Captions, Title (word reveals), Letterbox, Nav (island + full-screen menu), Rail (timecode HUD), PartnerBadge, Loader, Footer (range grid + close) |
-| `public/media/desktop/` | 1080p clips, GOP 8, no B-frames (77 MB total) |
-| `public/media/mobile/` | 720p clips, GOP 6 (32 MB total) |
-| `public/media/posters/` | First/last frame of each clip (WebP), used for instant paint and reduced motion |
+| `public/media/posters/` | First/last frame WebP stills, used as loading fallbacks and for reduced motion |
+| `public/media/cards/` | Flavor grid images |
 | `public/brand/` | Optimised logos (`golden-eagle.webp`, `eagle-emblem.webp`, `frutex-on-dark.svg`) |
 | `brand-source/` | The original logo files you supplied |
-| `scripts/encode.sh` | Re-creates everything in `public/media` from `media/raw` |
+| `scripts/encode.sh` | Regenerates poster stills; temporary MP4 intermediates are not written to `public/` |
 
-## Clip order (raw Cloudinary file → scene)
+## Mux clip order
 
-| # | Scene | Cloudinary file |
+Playback IDs are stored with the scenes so clips can be reordered by their content. The extra summit link supplied was a duplicate and is not used twice.
+
+| # | Scene | Mux playback ID |
 |---|---|---|
-| 01 | Mountain approach | `75ec4de7…` (`…_1` is a byte-identical duplicate, unused) |
-| 02 | Ice reveal | `e10a46c5…` |
-| 03 | Shatter → Original | `7c748a97…` |
-| 04 | Original → Red | `963c6c93…` |
-| 05 | Red → Sugar Free | `110663ff…` |
-| 06 | Sugar Free → Tropical | `2d4286d9…` |
-| 07 | Tropical → Strawberry | `d2cd5336…` |
-| 08 | Strawberry → Coffee | `ef884f43…` |
-| 09 | Coffee → Energy | `8cdaae14…` |
-| 10 | Energy → Movement | `1a3251da…` |
-| 11 | Kosovo | `a007d465…` |
-| 12 | World | `3f932ce5…` |
-| 13 | Return → Final hero | `65b0bfc3…` |
+| 01 | Summit | `auLDErgiw9PWL1kJqNSUkWOE5l8nc1UTvF9PBYJKxY00` |
+| 02 | Ice | `srdJHmwBJXiHNgJ7R1STYq4TpKeQ33CCKhefvJkm7Rg` |
+| 03 | Shatter | `XCPePN0100dmO8LFnBM1AXL01hSLiT02L1pdUnOC025XOaL00` |
+| 04 | Red | `JAGqKwjFfsXTiOMD3PFwOMFgb1XV6mWuvBFXLZXiEj8` |
+| 05 | Sugar Free | `Ij0101JSV00vMgxylefgSSIg4psJvdi31k4AHeQkZXNNC8` |
+| 06 | Tropical | `7TS334bW5Z003jf00CiAkz02NmXeQoIoGT006N1w00wT01eiA` |
+| 07 | Strawberry | `lPecdopcDDHSyLHh1wcDL83xWcyh7cA00Owd01018012F6A` |
+| 08 | Coffee | `EajZNX0102ThZTfUbW501rw2RYHMTxApyftvDBE2FzTMf4` |
+| 09 | Energy | `JtXlDYMwpYvCE8ViU6c00Nkngki02pxW008HIPHacOZ600g` |
+| 10 | Movement | `DE4Yfmf5bf1bS2RdgXwOfrFGvBH8PSCOmhXQezfIPeA` |
+| 11 | Kosovo | `M78h7At2FzCdjom01qkekSBGdo003Uh83XECiNy6TlJFQ` |
+| 12 | World | `4O25EWtiLDSC00CD5XtMqxfcpMWCRfLPjd1pI7v23zrY` |
+| 13 | Return | `01ES7RTCtRg1KNEWq81qBIRZUG802na9fCP6xYC4rjsJY` |
 
 ## The watermark
 
-The "AI generated" text is removed in the encode (ffmpeg `delogo` plus a feathered blur). The Golden Eagle × Frutex glass badge is then pinned over that area at runtime: the engine works out where `object-fit: cover` put that patch for the current screen size.
+The poster generator removes the known "AI generated" label from its temporary source encode before saving local stills. At runtime the Golden Eagle × Frutex glass badge is pinned over the matching patch in the Mux footage; the engine accounts for the current `object-fit: cover` crop.
 
 ## Performance notes
 
 - **The scroll handler only stores `scrollY`.** One rAF loop eases toward it (frame-rate-independent exponential smoothing) and sleeps when settled.
-- **Video seeks happen only when the target frame changes,** never while a seek is in flight, and always to the middle of the frame. Neighbouring clips are parked on their boundary frames, so the hand-off between clips is invisible.
-- **Clips are downloaded whole into memory (Blob → object URL),** nearest-ahead first, two at a time, so seeking never waits on network range requests. A clip falls back to streaming if a download fails or stalls.
-- **The screen is never empty.** A clip is only shown once it has decoded a frame. Until then the engine holds the neighbouring clip's matching boundary frame, or the scene's poster still (posters are pre-decoded and swapped in as elements, so they never blank).
-- **Outrunning the downloads degrades to streaming, not black.** If the scene on screen hasn't downloaded yet (and won't land within ~1.5 s, judged from live download progress), it streams immediately with priority: its duplicate download is cancelled and background prefetches pause until it shows a frame. Downloads of clips already scrolled past are cancelled. The next scene pre-streams only once the current one is satisfied.
-- **Slow connections are named, not hidden.** If the scene on screen has waited on the network for 0.9 s, a small glass notice under the nav says "Your connection is slow" with the download progress (`NetworkNotice.tsx`). It clears once footage has flowed for 2 s, never shows on a good line, and is announced once to screen readers.
-- **No more than five `<video>` elements hold a source at once on phones and iOS,** to keep decoder memory in check. On desktop-class devices every downloaded clip stays attached instead: attaching or detaching a source spins a hardware decoder up or down and stalls the compositor for 100–180 ms, so it happens once per clip, only while the viewer is at rest, and never at a scene boundary mid-scroll.
+- **Video seeks happen only when the target frame changes,** never while a seek is in flight, and always to the middle of the frame.
+- **Mux delivers adaptive HLS streams.** The current and next clips are loaded, while the previous clip stays available around the cut; older sources are detached to limit decoder and network use.
+- **The screen is never empty.** A clip is shown only after a frame decodes. While a stream is loading or seeking, the engine holds a decoded frame or a local poster instead of exposing a black video layer.
+- **Slow connections are named, not hidden.** If the scene on screen has waited on the network for 0.9 s, a small glass notice under the nav says "Your connection is slow" (`NetworkNotice.tsx`). It clears once footage has flowed for 2 s and is announced to screen readers.
+- **At most three `<video>` elements hold sources at once,** keeping a small decoder window for scene cuts without retaining the whole film.
 - **GPU warm-up under the loader.** Every glass card and the flavor light are composited once at near-zero opacity while the loader is up. The first backdrop-blur draw otherwise costs a 250 ms+ stall, which used to land on the first flavor.
 - **Nothing is drawn behind the footer.** Once the range section fills the viewport, the film layers drop to opacity 0 and the compositor skips them (no decoder teardown, so coming back up is instant). Footer reveals animate only `opacity` and `transform`.
-- **Clips use a short keyframe interval with no B-frames,** so a random seek decodes at most 7 frames (the raw files had one keyframe per clip).
 - **Captions animate only `opacity` and `transform`,** and each value is written only when it changes. React never re-renders per frame.
 - **Liquid glass (`backdrop-filter`) is limited to small surfaces:** the nav, badge and cards.
-- `prefers-reduced-motion` shows still frames per scene with no video downloads, and captions don't move.
+- `prefers-reduced-motion` shows local still frames per scene without attaching video streams, and captions don't move.
 
-Measured on a production build with headless Chrome while scrubbing: about 0.4 ms of script and 0.4 ms of style work per frame, layout close to zero, no long tasks, and a 2.2 MB JS heap.
+## Mux playback
 
-Whole-film scroll test (production build, Chrome, 1440×900, forward and back at 1800 px/s plus a slow 700 px/s pass): 1 dropped frame out of about 7,000, worst frame 33 ms. Before the decoder and warm-up changes the slow pass alone dropped 65 frames with stalls up to 350 ms.
-
-## Hosting the clips on a CDN
-
-The clips are served from `/media` by default. To serve them from Cloudinary (or any CDN), upload the **encoded** files with the same folder layout (`desktop/`, `mobile/`, `posters/`) and set:
-
-```
-VITE_MEDIA_BASE=https://res.cloudinary.com/<cloud>/video/upload/<folder>
-```
-
-Use the encoded files, not the raw uploads: the raw ones still carry the watermark and have one keyframe per clip, which makes scrubbing stutter.
+The browser requests `https://stream.mux.com/<playback-id>.m3u8`. Safari uses native HLS; other browsers lazy-load hls.js. The local MP4 encodes are not part of the website bundle or deployment. Only the small poster and flavor-card images remain local.

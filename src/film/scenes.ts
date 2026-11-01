@@ -42,8 +42,10 @@ export interface Caption {
 
 export interface Scene {
   id: string
-  /** File stem in /media/{desktop|mobile}/ */
+  /** Local poster stem. */
   file: string
+  /** Public Mux playback ID for this clip. */
+  playbackId: string
   frames: number
   holdVh: number
   chapter?: string
@@ -121,6 +123,7 @@ export const SCENES: Scene[] = [
   {
     id: 'summit',
     file: '01',
+    playbackId: 'auLDErgiw9PWL1kJqNSUkWOE5l8nc1UTvF9PBYJKxY00',
     frames: 146,
     holdVh: 0,
     chapter: 'Summit',
@@ -147,6 +150,7 @@ export const SCENES: Scene[] = [
   {
     id: 'ice',
     file: '02',
+    playbackId: 'srdJHmwBJXiHNgJ7R1STYq4TpKeQ33CCKhefvJkm7Rg',
     frames: 97,
     holdVh: 0,
     captions: [
@@ -163,6 +167,7 @@ export const SCENES: Scene[] = [
   {
     id: 'shatter',
     file: '03',
+    playbackId: 'XCPePN0100dmO8LFnBM1AXL01hSLiT02L1pdUnOC025XOaL00',
     frames: 146,
     holdVh: 90,
     chapter: 'Flavors',
@@ -171,14 +176,15 @@ export const SCENES: Scene[] = [
       flavorCaption(FLAVORS[0]),
     ],
   },
-  { id: 'red', file: '04', frames: 146, holdVh: 80, captions: [flavorCaption(FLAVORS[1])] },
-  { id: 'sugarfree', file: '05', frames: 122, holdVh: 80, captions: [flavorCaption(FLAVORS[2])] },
-  { id: 'tropical', file: '06', frames: 122, holdVh: 80, captions: [flavorCaption(FLAVORS[3])] },
-  { id: 'strawberry', file: '07', frames: 122, holdVh: 80, captions: [flavorCaption(FLAVORS[4])] },
-  { id: 'coffee', file: '08', frames: 122, holdVh: 80, captions: [flavorCaption(FLAVORS[5])] },
+  { id: 'red', file: '04', playbackId: 'JAGqKwjFfsXTiOMD3PFwOMFgb1XV6mWuvBFXLZXiEj8', frames: 146, holdVh: 80, captions: [flavorCaption(FLAVORS[1])] },
+  { id: 'sugarfree', file: '05', playbackId: 'Ij0101JSV00vMgxylefgSSIg4psJvdi31k4AHeQkZXNNC8', frames: 122, holdVh: 80, captions: [flavorCaption(FLAVORS[2])] },
+  { id: 'tropical', file: '06', playbackId: '7TS334bW5Z003jf00CiAkz02NmXeQoIoGT006N1w00wT01eiA', frames: 122, holdVh: 80, captions: [flavorCaption(FLAVORS[3])] },
+  { id: 'strawberry', file: '07', playbackId: 'lPecdopcDDHSyLHh1wcDL83xWcyh7cA00Owd01018012F6A', frames: 122, holdVh: 80, captions: [flavorCaption(FLAVORS[4])] },
+  { id: 'coffee', file: '08', playbackId: 'EajZNX0102ThZTfUbW501rw2RYHMTxApyftvDBE2FzTMf4', frames: 122, holdVh: 80, captions: [flavorCaption(FLAVORS[5])] },
   {
     id: 'energy',
     file: '09',
+    playbackId: 'JtXlDYMwpYvCE8ViU6c00Nkngki02pxW008HIPHacOZ600g',
     frames: 122,
     holdVh: 60,
     chapter: 'Energy',
@@ -197,6 +203,7 @@ export const SCENES: Scene[] = [
   {
     id: 'movement',
     file: '10',
+    playbackId: 'DE4Yfmf5bf1bS2RdgXwOfrFGvBH8PSCOmhXQezfIPeA',
     frames: 122,
     holdVh: 60,
     chapter: 'Movement',
@@ -216,6 +223,7 @@ export const SCENES: Scene[] = [
   {
     id: 'kosovo',
     file: '11',
+    playbackId: 'M78h7At2FzCdjom01qkekSBGdo003Uh83XECiNy6TlJFQ',
     frames: 194,
     holdVh: 50,
     chapter: 'Kosovo',
@@ -235,6 +243,7 @@ export const SCENES: Scene[] = [
   {
     id: 'world',
     file: '12',
+    playbackId: '4O25EWtiLDSC00CD5XtMqxfcpMWCRfLPjd1pI7v23zrY',
     frames: 146,
     holdVh: 50,
     chapter: 'World',
@@ -252,6 +261,7 @@ export const SCENES: Scene[] = [
   {
     id: 'return',
     file: '13',
+    playbackId: '01ES7RTCtRg1KNEWq81qBIRZUG802na9fCP6xYC4rjsJY',
     frames: 146,
     holdVh: 130,
     chapter: 'Rise',
