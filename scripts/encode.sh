@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Re-encodes raw clips temporarily to regenerate local poster stills.
-# Runtime video is streamed from Mux; MP4 intermediates are never written into public/.
+# Re-encodes the raw AI clips for scroll scrubbing.
 #  - crops 1088px clips to 1080, removes the "AI generated" watermark (delogo + feathered blur)
 #  - short GOP (-g 8 desktop / -g 6 mobile) and no B-frames so random seeks decode only a few frames
 #  - +faststart so metadata is at the head of the file
@@ -9,9 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 RAW=media/raw
 OUT=public/media
-WORK="${TMPDIR:-/tmp}/golden-eagle-encode-$$"
-mkdir -p "$WORK/desktop" "$WORK/mobile" "$OUT/posters"
-trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$OUT/desktop" "$OUT/mobile" "$OUT/posters"
 
 # order: output-id raw-file
 MAP="01:u12 02:u07 03:u14 04:u11 05:u06 06:u05 07:u08 08:u02 09:u01 10:u03 11:u10 12:u09 13:u04"
@@ -25,12 +22,12 @@ encode() {
   local id=$1 src=$RAW/$2.mp4
   ffmpeg -v error -y -i "$src" -filter_complex "$FG" -an \
     -c:v libx264 -preset slow -crf 24 -g 8 -keyint_min 8 -sc_threshold 0 -bf 0 \
-    -profile:v high -movflags +faststart "$WORK/desktop/$id.mp4"
+    -profile:v high -movflags +faststart "$OUT/desktop/$id.mp4"
   ffmpeg -v error -y -i "$src" -filter_complex "$FG,scale=1280:720:flags=lanczos" -an \
     -c:v libx264 -preset slow -crf 26 -g 6 -keyint_min 6 -sc_threshold 0 -bf 0 \
-    -profile:v high -movflags +faststart "$WORK/mobile/$id.mp4"
-  ffmpeg -v error -y -i "$WORK/desktop/$id.mp4" -vf "select=eq(n\,0)" -frames:v 1 -c:v libwebp -quality 78 "$OUT/posters/$id-first.webp"
-  ffmpeg -v error -y -sseof -0.08 -i "$WORK/desktop/$id.mp4" -update 1 -frames:v 1 -c:v libwebp -quality 78 "$OUT/posters/$id-last.webp"
+    -profile:v high -movflags +faststart "$OUT/mobile/$id.mp4"
+  ffmpeg -v error -y -i "$OUT/desktop/$id.mp4" -vf "select=eq(n\,0)" -frames:v 1 -c:v libwebp -quality 78 "$OUT/posters/$id-first.webp"
+  ffmpeg -v error -y -sseof -0.08 -i "$OUT/desktop/$id.mp4" -update 1 -frames:v 1 -c:v libwebp -quality 78 "$OUT/posters/$id-last.webp"
   echo "done $id"
 }
 
@@ -39,4 +36,4 @@ for pair in $MAP; do encode "${pair%%:*}" "${pair##*:}" &
   while [ "$(jobs -rp | wc -l)" -ge 3 ]; do wait -n; done
 done
 wait
-du -sh "$OUT/posters"
+du -sh "$OUT"/desktop "$OUT"/mobile "$OUT"/posters

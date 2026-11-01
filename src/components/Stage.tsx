@@ -27,7 +27,6 @@ export const Stage = memo(function Stage({ engine }: { engine: FilmEngine }) {
               className="stage-video"
               style={{ objectPosition }}
               poster={i === 0 ? posterUrl(s.file, 'first') : undefined}
-              crossOrigin="anonymous"
               muted
               playsInline
               preload="auto"

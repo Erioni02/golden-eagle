@@ -1,6 +1,5 @@
-import type Hls from 'hls.js'
 import { CHAPTERS, FPS, SCENES, VH_PER_SECOND, type Scene } from './scenes'
-import { clipUrl, posterUrl } from './media'
+import { clipUrl, fetchClip, pickVariant, posterUrl, type Variant } from './media'
 
 /**
  * FilmEngine — the single source of animation truth.
@@ -19,10 +18,14 @@ import { clipUrl, posterUrl } from './media'
  */
 
 type ClipState = {
+  blobUrl: string | null
   attachedUrl: string | null
-  hls: Hls | null
+  fetching: boolean
+  failed: boolean
   primed: boolean
   priming: boolean
+  /** Download is taking too long for the scene on screen — stream it meanwhile. */
+  streamFallback: boolean
   /** Last frame we asked the decoder for (-1 = unknown). */
   requested: number
   frames: number
@@ -31,6 +34,14 @@ type ClipState = {
   /** An iOS seek is not display-ready until Safari reports the frame presented. */
   awaitingFrame: boolean
   frameCheckPending: boolean
+  /** Cancels this clip's download (when the viewer has already scrolled past it). */
+  fetchAbort: AbortController | null
+  /** Pending "stream it if the download hasn't landed" timer. */
+  graceTimer: number
+  /** Download progress (bytes) and start time, to tell "nearly here" from "far away". */
+  loaded: number
+  total: number
+  fetchStart: number
 }
 
 type CaptionRange = {
@@ -68,7 +79,18 @@ const PATCH = { x1: 1500, y1: 935, x2: 1880, y2: 1045 }
 
 export class FilmEngine {
   readonly scenes: Scene[] = SCENES
+  /** Desktop (1080p) or mobile (720p) clips. Drops to 720p for the rest of the visit on a slow line. */
+  variant: Variant = pickVariant()
   readonly reduced = matchMedia('(prefers-reduced-motion: reduce)').matches
+  /**
+   * Desktop-class device with decoder headroom: every downloaded clip stays attached. Attaching or
+   * detaching a <video> source spins a hardware decoder up / down, which stalls the compositor for
+   * 100–180 ms. Doing that at a scene boundary mid-scroll is a visible hitch, so on these devices it
+   * happens once per clip, while the viewer is at rest, and never again.
+   */
+  private readonly roomy =
+    !IS_IOS && this.variant === 'desktop' && ((navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8) >= 4
+
   /** Total film length in viewport heights (scroll distance mapped to footage). */
   readonly totalVh = SCENES.reduce((sum, s) => sum + (s.frames / FPS) * VH_PER_SECOND + s.holdVh, 0)
 
@@ -87,6 +109,8 @@ export class FilmEngine {
   private shown = -2
   private fallbackSrc = ''
   private preloaded = new Set<string>()
+  /** The on-screen clip being streamed with priority (-1 = none): background downloads pause for it. */
+  private streaming = -1
   /** Decoded poster images, by URL. These exact elements are put on screen (no second fetch). */
   private posterImgs = new Map<string, HTMLImageElement>()
   private rail: HTMLElement | null = null
@@ -118,15 +142,23 @@ export class FilmEngine {
   private ptr = { x: 0, y: 0 }
 
   private clips: ClipState[] = SCENES.map((s) => ({
+    blobUrl: null,
     attachedUrl: null,
-    hls: null,
+    fetching: false,
+    failed: false,
     primed: false,
     priming: false,
+    streamFallback: false,
     requested: -1,
     frames: s.frames,
     hasFrame: false,
     awaitingFrame: false,
     frameCheckPending: false,
+    fetchAbort: null,
+    graceTimer: 0,
+    loaded: 0,
+    total: 0,
+    fetchStart: 0,
   }))
 
   // layout (px) — recomputed on resize only
@@ -150,6 +182,8 @@ export class FilmEngine {
   private stageScale = 1
   private railScale = -1
 
+  private inflight = 0
+  private aborter = new AbortController()
   private listeners: { [K in keyof Events]: Set<Events[K]> } = { chapter: new Set(), load: new Set(), network: new Set() }
 
   // slow-connection notice
@@ -226,6 +260,7 @@ export class FilmEngine {
   mount() {
     if (this.mounted) return
     this.mounted = true
+    this.aborter = new AbortController()
 
     if ('scrollRestoration' in history) history.scrollRestoration = 'manual'
 
@@ -252,8 +287,11 @@ export class FilmEngine {
       this.setLoad(1, true)
     } else {
       this.warmLayers()
-      // Never hold the intro behind an HLS manifest or the first decoder startup.
+      this.pumpLoads()
+      // Don't hold the intro hostage on slow networks: after 6 s, stream instead.
       this.readyTimer = window.setTimeout(() => {
+        this.clips[0].streamFallback = true
+        if (this.active <= 1) this.attach(0)
         this.setLoad(this.loadState.progress, true)
       }, 6000)
     }
@@ -276,13 +314,20 @@ export class FilmEngine {
     clearTimeout(this.readyTimer)
     clearTimeout(this.slowTimer)
     clearTimeout(this.hideTimer)
+    clearTimeout(this.warmTimer)
+    this.warmTimer = 0
+    this.warming = -1
     this.waitSince = 0
     this.slow = false
     this.running = false
+    this.aborter.abort()
     this.clips.forEach((c, i) => {
-      c.hls?.destroy()
-      c.hls = null
-      c.attachedUrl = null
+      if (c.blobUrl) URL.revokeObjectURL(c.blobUrl)
+      clearTimeout(c.graceTimer)
+      c.graceTimer = 0
+      c.blobUrl = c.attachedUrl = null
+      c.fetching = false
+      c.fetchAbort = null
       c.hasFrame = false
       c.awaitingFrame = false
       c.frameCheckPending = false
@@ -293,6 +338,7 @@ export class FilmEngine {
         v.load()
       }
     })
+    this.inflight = 0
     this.active = -1
     this.shown = -2
     this.holdingFrame = false
@@ -335,12 +381,14 @@ export class FilmEngine {
 
   private onScroll = () => {
     this.targetY = window.scrollY
+    this.lastInput = performance.now()
     this.wake()
   }
   // touch already has native momentum — follow it closely
   private onTouch = () => {
     // Keep the film close to native touch momentum; a slow catch-up reads as judder on phones.
     this.stiffness = 15
+    this.lastInput = performance.now()
     // Retry the muted iOS decoder unlock inside a real touch gesture if autoplay was refused.
     if (IS_IOS && this.active >= 0) this.primeClip(this.active)
   }
@@ -348,6 +396,7 @@ export class FilmEngine {
   private onWheel = () => {
     // A shorter easing tail makes scrubbed footage respond immediately while retaining glide.
     this.stiffness = 12
+    this.lastInput = performance.now()
   }
   private onPointer = (e: PointerEvent) => {
     this.ptrTarget.x = (e.clientX / this.vw) * 2 - 1
@@ -726,32 +775,77 @@ export class FilmEngine {
       if (prev >= 0 && this.stills[prev]) this.stills[prev].style.opacity = '0'
     } else {
       // Video layers are swapped in present(), and only once the new clip has a decoded frame.
+      if (this.streaming !== -1 && this.streaming !== i) this.streaming = -1
+      this.dropStaleDownloads()
       this.updateWindow(i)
+      this.pumpLoads()
+      this.scheduleStream(i)
+      this.scheduleStream(i + 1)
       this.preloadPosters(i)
     }
     if ((this.scenes[i].focusX ?? 0.5) !== (this.scenes[Math.max(prev, 0)].focusX ?? 0.5)) this.positionBadge()
   }
 
   /**
-   * Keep the current and next HLS clips ready, plus the previous clip for the cut. Each attached
-   * source holds decoder and network state, so limiting this window matters on mobile devices.
+   * Only a few <video> elements hold a source at once (decoder memory — iOS is strict about this).
+   * Window: previous, current, next two. Anything further away is detached.
    */
   private updateWindow(i: number) {
     this.clips.forEach((c, k) => {
-      const want = k >= i && k <= i + 1
-      const keep = k >= i - 1 && k <= i + 1
+      const want = k >= i - 1 && k <= i + 2
+      const keep = this.roomy || (k >= i - 2 && k <= i + 3) // hysteresis so scrolling back and forth doesn't thrash
       if (want) this.attach(k)
       else if (!keep && c.attachedUrl && k !== this.shown) this.detach(k)
     })
+    this.scheduleWarm()
   }
+
+  /**
+   * Roomy devices: attaches downloaded clips outside the decode window ahead of time, one at a
+   * time and only while the viewer is at rest (reading the intro, pausing on a flavor), so the
+   * decoder spin-up never lands mid-scroll.
+   */
+  private scheduleWarm() {
+    if (!this.roomy || this.warmTimer || !this.mounted) return
+    this.warmTimer = window.setTimeout(() => {
+      this.warmTimer = 0
+      if (!this.mounted) return
+      // one decoder spin-up at a time (a clip that never decodes is given up on after 3 s)
+      if (this.warming >= 0 && !this.clips[this.warming].hasFrame && performance.now() - this.warmSince < 3000) return this.scheduleWarm()
+      this.warming = -1
+      const calm = performance.now() - this.lastInput > 350 && Math.abs(this.targetY - this.smoothY) < 1
+      if (!calm) return this.scheduleWarm()
+      const from = Math.max(this.active, 0)
+      let best = -1
+      this.clips.forEach((c, k) => {
+        if (!c.blobUrl || c.attachedUrl) return
+        if (best < 0 || Math.abs(k - from) + (k < from ? 0.5 : 0) < Math.abs(best - from) + (best < from ? 0.5 : 0)) best = k
+      })
+      if (best < 0) return // everything downloaded is warm; a landing download re-schedules
+      this.warming = best
+      this.warmSince = performance.now()
+      this.attach(best)
+      this.scheduleWarm()
+    }, 220)
+  }
+  private warmTimer = 0
+  private warming = -1
+  private warmSince = 0
+  private lastInput = 0
 
   private attach(k: number) {
     const c = this.clips[k]
     const v = this.videos[k]
     if (!v) return
-    const url = clipUrl(this.scenes[k].playbackId)
+    // Prefer the in-memory copy. While it's still downloading, show the poster rather than
+    // streaming: a streamed clip turns every scrub step into a network range request.
+    // The network URL is only used if the download failed or the user outran it (streamFallback).
+    const streamOk = c.failed || (c.streamFallback && (k === this.active || (k === this.active + 1 && this.activeSatisfied())))
+    const url = c.blobUrl ?? (streamOk ? clipUrl(this.variant, this.scenes[k].file) : null)
     if (!url || c.attachedUrl === url) return
-    if (c.attachedUrl) this.detach(k)
+    // Upgrading a clip that is on screen (active, or held as the last good picture) from
+    // stream → blob would blank it while the new source loads; wait until it's off-screen.
+    if (c.attachedUrl && (k === this.active || k === this.shown)) return
     c.attachedUrl = url
     c.requested = -1
     c.primed = false
@@ -759,55 +853,10 @@ export class FilmEngine {
     c.hasFrame = false
     c.awaitingFrame = false
     c.frameCheckPending = false
-    // Posters are local, tiny stills that cover the video while its HLS playlist buffers/seeks.
+    // posters are assigned lazily so 13 images aren't fetched up front
     if (!v.getAttribute('poster')) v.poster = posterUrl(this.scenes[k].file, 'first')
-    if (v.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari, including iPhone, has native HLS support.
-      v.src = url
-      v.load()
-    } else {
-      // Keep hls.js out of the initial bundle; Safari uses native HLS and never downloads it.
-      void import('hls.js')
-        .then(({ default: Hls }) => {
-          if (!this.mounted || c.attachedUrl !== url || this.videos[k] !== v) return
-          if (!Hls.isSupported()) {
-            c.attachedUrl = null
-            if (k === 0) this.setLoad(1, true)
-            this.wake()
-            return
-          }
-          const hls = new Hls({
-            capLevelToPlayerSize: true,
-            maxBufferLength: 6,
-            maxMaxBufferLength: 12,
-            backBufferLength: 0,
-            enableWorker: true,
-            lowLatencyMode: false,
-          })
-          c.hls = hls
-          hls.on(Hls.Events.ERROR, (_event, data) => {
-            if (!data.fatal || c.attachedUrl !== url) return
-            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad()
-            else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError()
-            else {
-              hls.destroy()
-              c.hls = null
-              c.attachedUrl = null
-              c.hasFrame = false
-              if (k === 0) this.setLoad(1, true)
-              this.wake()
-            }
-          })
-          hls.loadSource(url)
-          hls.attachMedia(v)
-        })
-        .catch(() => {
-          if (c.attachedUrl !== url) return
-          c.attachedUrl = null
-          if (k === 0) this.setLoad(1, true)
-          this.wake()
-        })
-    }
+    v.src = url
+    v.load()
   }
 
   private detach(k: number) {
@@ -820,8 +869,6 @@ export class FilmEngine {
     c.frameCheckPending = false
     c.primed = false
     c.priming = false
-    c.hls?.destroy()
-    c.hls = null
     if (!v) return
     v.removeAttribute('src')
     v.load()
@@ -842,8 +889,11 @@ export class FilmEngine {
       c.hasFrame = true
       this.restoreHeldFrame(k)
     }
+    if (k === this.streaming && c.hasFrame) {
+      this.streaming = -1
+      this.pumpLoads()
+    }
     if (Number.isFinite(v.duration) && v.duration > 0) c.frames = Math.max(1, Math.round(v.duration * FPS))
-    if (k === 0 && c.hasFrame) this.setLoad(1, true)
     this.wake()
   }
 
@@ -861,7 +911,7 @@ export class FilmEngine {
         c.primed = true
         c.requested = -1
         c.hasFrame = c.attachedUrl !== null && v.readyState >= 2 && !v.seeking
-        this.onFrameReady(k, c.hasFrame)
+        this.resumeLoadsAfterFrame(k, c.hasFrame)
         this.wake()
       })
       .catch(() => {
@@ -880,7 +930,7 @@ export class FilmEngine {
       c.awaitingFrame = false
       c.hasFrame = !!c.attachedUrl && v.readyState >= 2
       this.restoreHeldFrame(k)
-      this.onFrameReady(k, c.hasFrame)
+      this.resumeLoadsAfterFrame(k, c.hasFrame)
       this.wake()
       return
     }
@@ -894,7 +944,7 @@ export class FilmEngine {
         c.awaitingFrame = false
         c.hasFrame = true
         this.restoreHeldFrame(k)
-        this.onFrameReady(k, true)
+        this.resumeLoadsAfterFrame(k, true)
         this.wake()
       } else {
         this.confirmPresentedFrame(k)
@@ -930,8 +980,10 @@ export class FilmEngine {
     this.holdingFrame = false
   }
 
-  private onFrameReady(k: number, ready: boolean) {
-    if (ready && k === 0) this.setLoad(1, true)
+  private resumeLoadsAfterFrame(k: number, ready: boolean) {
+    if (!ready || k !== this.streaming) return
+    this.streaming = -1
+    this.pumpLoads()
   }
 
   /**
@@ -996,6 +1048,50 @@ export class FilmEngine {
   }
 
   /**
+   * If a clip's download hasn't landed shortly after it's needed, stream it from the network
+   * meanwhile. Per clip, and not cancelled by further scrolling: fast scrolling must never be
+   * able to starve a scene of footage.
+   */
+  private scheduleStream(k: number) {
+    const c = this.clips[k]
+    if (!c || c.attachedUrl || c.blobUrl || c.graceTimer) return
+    const decide = () => {
+      c.graceTimer = 0
+      if (!this.mounted || c.attachedUrl || c.blobUrl) return
+      if (k === 0 && !this.loadState.ready) return // the intro gate handles the first clip
+      const next = k === this.active + 1
+      if (k !== this.active && !next) return // the viewer already moved on
+      if (next && !this.activeSatisfied()) {
+        c.graceTimer = window.setTimeout(decide, 400) // never compete with the scene on screen
+        return
+      }
+      // Is the proper (in-memory) copy nearly here? Then wait for it: streaming now would cancel
+      // downloads that are about to land and cascade into the next scenes.
+      if (c.fetching && c.total > 0) {
+        const elapsed = Math.max((performance.now() - c.fetchStart) / 1000, 0.05)
+        const eta = c.loaded > 0 ? (c.total - c.loaded) / (c.loaded / elapsed) : Infinity
+        if (eta < 1.5) {
+          c.graceTimer = window.setTimeout(decide, 250)
+          return
+        }
+      }
+      c.streamFallback = true
+      if (!next) {
+        // The scene on screen gets the whole connection until it has a frame: cancel the duplicate
+        // download of this clip and the background prefetches (they resume right after).
+        this.streaming = k
+        this.clips.forEach((x) => x.fetching && x.fetchAbort?.abort())
+        if (this.slow && this.netProgress !== null) {
+          this.netProgress = null
+          this.listeners.network.forEach((fn) => fn(true, null))
+        }
+      }
+      this.attach(k)
+    }
+    c.graceTimer = window.setTimeout(decide, 400)
+  }
+
+  /**
    * The slow-connection notice. Shown only after the scene on screen has waited on the network
    * for 0.9 s (brief hand-off gaps on a good line never trigger it). Once up, it only clears after
    * footage has flowed for 2 s (and never before it has been up 3 s), so a visitor flicking
@@ -1026,11 +1122,53 @@ export class FilmEngine {
     if (on === this.slow || !this.mounted) return
     this.slow = on
     if (on) {
+      this.downgrade()
       this.slowSince = performance.now()
-      // Segment based HLS progress is not a meaningful percentage of a whole clip.
-      this.netProgress = null
+      this.netProgress = this.activeProgress()
     }
     this.listeners.network.forEach((fn) => fn(on, this.netProgress))
+  }
+
+  /** Observed download speed of a finished clip; below ~12 Mbps the 1080p film can't keep up. */
+  private measureSpeed(c: ClipState) {
+    const secs = (performance.now() - c.fetchStart) / 1000
+    if (c.total > 1e6 && secs > 0.2 && (c.total * 8) / secs / 1e6 < 12) this.downgrade()
+  }
+
+  /**
+   * Switches all clips not yet downloaded to the 720p set (~40% of the bytes). Clips already in
+   * memory keep their quality; in-flight 1080p downloads are restarted at 720p, except the clip
+   * on screen if it is nearly done.
+   */
+  private downgrade() {
+    if (this.variant === 'mobile') return
+    this.variant = 'mobile'
+    this.clips.forEach((c, k) => {
+      if (!c.fetching) return
+      const nearly = c.total && c.loaded / c.total > 0.6
+      if (k === this.active && nearly) return
+      c.fetchAbort?.abort()
+    })
+  }
+
+  /** Download progress of the scene on screen (null while streaming / unknown). */
+  private activeProgress(): number | null {
+    const c = this.clips[this.active]
+    if (!c || !c.fetching || !c.total) return null
+    return Math.min(c.loaded / c.total, 1)
+  }
+
+  /** The scene on screen has decoded footage (from memory or its stream). */
+  private activeSatisfied() {
+    const c = this.clips[this.active]
+    return !!c && !!c.attachedUrl && c.hasFrame
+  }
+
+  /** Cancels downloads of clips the viewer has already scrolled past, so bandwidth goes ahead. */
+  private dropStaleDownloads() {
+    this.clips.forEach((c, k) => {
+      if (c.fetching && k < this.active - 1) c.fetchAbort?.abort()
+    })
   }
 
   /** Warms the poster stills for the next few scenes (small WebPs) so the fallback is instant. */
@@ -1117,4 +1255,80 @@ export class FilmEngine {
     this.listeners.load.forEach((fn) => fn(progress, r))
   }
 
+  /** Downloads clips as Blobs, two at a time, nearest-ahead first. */
+  private pumpLoads() {
+    if (!this.mounted) return
+    if (this.streaming !== -1) return // the on-screen stream has priority until it shows a frame
+    const from = Math.max(this.active, 0)
+    while (this.inflight < 2) {
+      let best = -1
+      let bestScore = Infinity
+      this.clips.forEach((c, k) => {
+        if (c.blobUrl || c.fetching || c.failed) return
+        const d = k - from
+        const score = d >= 0 ? d : -d * 2.5 // prefer what's ahead of the viewer
+        if (score < bestScore) {
+          bestScore = score
+          best = k
+        }
+      })
+      if (best < 0) return
+      this.loadClip(best)
+    }
+  }
+
+  private loadClip(k: number) {
+    const c = this.clips[k]
+    c.fetching = true
+    this.inflight++
+    const url = clipUrl(this.variant, this.scenes[k].file)
+    const root = this.aborter.signal // a destroyed mount (StrictMode, HMR): ignore everything
+    const own = new AbortController() // this clip only: cancelled when the viewer scrolls past it
+    const onRootAbort = () => own.abort()
+    root.addEventListener('abort', onRootAbort, { once: true })
+    c.fetchAbort = own
+    c.loaded = c.total = 0
+    c.fetchStart = performance.now()
+    fetchClip(
+      url,
+      (loaded, total) => {
+        c.loaded = loaded
+        c.total = total
+        // only while the scene is actually waiting: once footage is up, background progress is noise
+        if (this.slow && this.waitSince && k === this.active && total) {
+          const pr = Math.floor((loaded / total) * 100) / 100
+          if (pr !== this.netProgress) {
+            this.netProgress = pr
+            this.listeners.network.forEach((fn) => fn(true, pr))
+          }
+        }
+        if (k === 0 && total && !root.aborted) this.setLoad(Math.min(loaded / total, 1), false)
+      },
+      own.signal,
+    )
+      .then((blobUrl) => {
+        if (root.aborted) return URL.revokeObjectURL(blobUrl)
+        c.blobUrl = blobUrl
+        this.measureSpeed(c)
+        // attach now if it's inside the decode window (upgrades an off-screen streamed source too)
+        if (k >= this.active - 1 && k <= this.active + 2) this.attach(k)
+        else this.scheduleWarm()
+        if (k === 0) this.setLoad(1, true)
+      })
+      .catch(() => {
+        if (own.signal.aborted) return // cancelled on purpose: refetched later if needed
+        c.failed = true // stays on the streamed URL
+        if (k === 0) this.setLoad(1, true)
+        if (k >= this.active - 1 && k <= this.active + 2) this.attach(k)
+      })
+      .finally(() => {
+        root.removeEventListener('abort', onRootAbort)
+        if (root.aborted) return
+        c.fetching = false
+        c.fetchAbort = null
+        this.inflight--
+        this.pumpLoads()
+        this.wake()
+      })
+  }
 }
