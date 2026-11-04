@@ -16,7 +16,8 @@ export default function App() {
 
   useEffect(() => {
     engine.mount()
-    if (import.meta.env.DEV) Object.assign(window, { __film: engine }) // console access while developing
+    // console access while developing, and on a production build with ?debug (benchmarks)
+    if (import.meta.env.DEV || location.search.includes('debug')) Object.assign(window, { __film: engine })
     return () => engine.destroy()
   }, [engine])
 

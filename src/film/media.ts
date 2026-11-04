@@ -1,9 +1,9 @@
 /**
  * Clip sources + Blob buffering.
  *
- * Scrubbing a network-streamed <video> turns every seek into an HTTP range request.
- * Each clip is small (2–10 MB), so we download it whole and play it from an object URL:
- * seeks then hit memory only. Falls back to the plain URL if fetch fails (CORS, offline…).
+ * Scrubbing a network-streamed clip turns every seek into an HTTP range request.
+ * Each clip is small (2–10 MB), so we download it whole: the decoder reads it straight from
+ * memory (or a <video> plays it from an object URL). Falls back to the plain URL if fetch fails.
  */
 
 const BASE = (import.meta.env.VITE_MEDIA_BASE as string | undefined)?.replace(/\/$/, '') || '/media'
@@ -23,13 +23,13 @@ export const posterUrl = (file: string, which: 'first' | 'last') => `${BASE}/pos
 
 type Progress = (loaded: number, total: number) => void
 
-export async function fetchClip(url: string, onProgress?: Progress, signal?: AbortSignal): Promise<string> {
+export async function fetchClip(url: string, onProgress?: Progress, signal?: AbortSignal): Promise<Blob> {
   const res = await fetch(url, { signal })
   if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} for ${url}`)
   // The browser assembles the Blob natively (concatenating chunks in JS costs ~50 ms of main
   // thread per clip, a dropped frame mid-scroll). For progress, a tee'd copy of the stream is
   // only counted, never stored.
-  if (!onProgress) return URL.createObjectURL(await res.blob())
+  if (!onProgress) return res.blob()
   const total = Number(res.headers.get('content-length')) || 0
   const [counted, kept] = res.body.tee()
   const blob = new Response(kept).blob()
@@ -43,5 +43,5 @@ export async function fetchClip(url: string, onProgress?: Progress, signal?: Abo
       onProgress(loaded, total)
     }
   })().catch(() => {})
-  return URL.createObjectURL(await blob)
+  return blob
 }

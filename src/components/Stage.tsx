@@ -36,6 +36,8 @@ export const Stage = memo(function Stage({ engine }: { engine: FilmEngine }) {
             />
           )
         })}
+        {/* decoded frames (WebCodecs): the film's main surface where supported, above the <video> layers */}
+        {!engine.reduced && <canvas ref={engine.registerCanvas} className="stage-video" aria-hidden="true" />}
       </div>
       {/* fallback still: shown only while the scene on screen has no decoded video frame yet */}
       {!engine.reduced && <img ref={engine.registerFallback} className="stage-video stage-still" alt="" decoding="async" />}
@@ -53,6 +55,8 @@ export const Stage = memo(function Stage({ engine }: { engine: FilmEngine }) {
       <div ref={engine.registerTone} className="tone-light absolute inset-0" />
       {/* grain sits above the footage, below all type, so copy stays sharp */}
       <div className="grain" />
+      {/* dims the film as the range section rises over it */}
+      <div ref={engine.registerShade} className="absolute inset-0 bg-ink opacity-0" />
     </div>
   )
 })

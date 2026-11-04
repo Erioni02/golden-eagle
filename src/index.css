@@ -355,10 +355,11 @@
       linear-gradient(to bottom, rgb(0 0 0 / 0.38) 0%, transparent 18%);
   }
 
-  /* Fine film grain stays static so the full-screen overlay does not animate during scrubbing. */
+  /* Fine film grain stays static so the full-screen overlay does not animate during scrubbing.
+     Exactly viewport-sized: an oversized plate costs Safari a 4× texture for nothing. */
   .grain {
     position: absolute;
-    inset: -50%;
+    inset: 0;
     background: url('/textures/grain.png') repeat;
     background-size: 192px;
     opacity: 0.24;

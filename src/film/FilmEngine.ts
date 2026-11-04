@@ -1,23 +1,29 @@
 import { CHAPTERS, FPS, SCENES, VH_PER_SECOND, type Scene } from './scenes'
 import { clipUrl, fetchClip, pickVariant, posterUrl, type Variant } from './media'
+import { FrameStore, codecSupported, type Clip } from './decoder'
 
 /**
  * FilmEngine — the single source of animation truth.
  *
  *   scroll event ──► targetY (just a number, nothing else happens in the handler)
  *                       │
- *   one rAF loop ──► smoothY eases toward targetY (frame-rate independent)
+ *   one rAF loop ──► smoothY follows targetY on a critically damped spring (frame-rate independent)
  *                       │
- *                       ├─► active scene + frame  ──► video.currentTime (only when the frame changes
- *                       │                              and the previous seek has finished)
+ *                       ├─► active scene + fractional frame ──► canvas: the decoded frame, cross-faded
+ *                       │                                       into the next one between whole frames
+ *                       │     (no WebCodecs: video.currentTime, only when the frame changes and the
+ *                       │      previous seek has finished)
  *                       ├─► caption opacity/transform (compositor-only, written only when changed)
- *                       └─► progress rail scaleY, hold "breathing" scale
+ *                       └─► progress rail scaleY, hold "breathing" + speed push scale, footer parallax
  *
  * React renders the static DOM once and hands element refs to the engine; no per-frame React state.
- * The loop sleeps when everything has settled and wakes on scroll / resize / seeked.
+ * The loop sleeps when everything has settled and wakes on scroll / resize / decoded frame / seeked.
  */
 
 type ClipState = {
+  /** The downloaded clip (null until it has fully arrived). */
+  blob: Blob | null
+  /** Object URL of `blob`, made only if a <video> needs it. */
   blobUrl: string | null
   attachedUrl: string | null
   fetching: boolean
@@ -77,19 +83,35 @@ const IS_IOS =
 /** Watermark-blur patch in source pixels (1920×1080) — the partner badge is pinned over it. */
 const PATCH = { x1: 1500, y1: 935, x2: 1880, y2: 1045 }
 
+/** `shown` value for the decoded-frame canvas (video layers are 0…n, the poster still is -1). */
+const CANVAS = -3
+
+const QUERY = new URLSearchParams(location.search)
+
 export class FilmEngine {
   readonly scenes: Scene[] = SCENES
   /** Desktop (1080p) or mobile (720p) clips. Drops to 720p for the rest of the visit on a slow line. */
   variant: Variant = pickVariant()
   readonly reduced = matchMedia('(prefers-reduced-motion: reduce)').matches
   /**
-   * Desktop-class device with decoder headroom: every downloaded clip stays attached. Attaching or
-   * detaching a <video> source spins a hardware decoder up / down, which stalls the compositor for
-   * 100–180 ms. Doing that at a scene boundary mid-scroll is a visible hitch, so on these devices it
-   * happens once per clip, while the viewer is at rest, and never again.
+   * Frames come from WebCodecs and are drawn on a canvas, in every browser that has it. A seeked
+   * <video> can only change its picture as fast as seeks complete (one at a time): in Chrome that
+   * was every other screen refresh at a normal scrolling speed, and in Safari far worse (stutter,
+   * blanking). The canvas changes on every refresh. `?video` forces the <video> path for QA.
+   * Turned off for the rest of the visit if decoding fails for two clips or can't keep up.
+   */
+  private codec = codecSupported() && !this.reduced && !QUERY.has('video')
+  /**
+   * <video> path only. Desktop-class device with decoder headroom: every downloaded clip stays attached.
+   * Attaching or detaching a <video> source spins a hardware decoder up / down, which stalls the
+   * compositor for 100–180 ms. Doing that at a scene boundary mid-scroll is a visible hitch, so on
+   * these devices it happens once per clip, while the viewer is at rest, and never again.
    */
   private readonly roomy =
-    !IS_IOS && this.variant === 'desktop' && ((navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8) >= 4
+    !this.codec &&
+    !IS_IOS &&
+    this.variant === 'desktop' &&
+    ((navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8) >= 4
 
   /** Total film length in viewport heights (scroll distance mapped to footage). */
   readonly totalVh = SCENES.reduce((sum, s) => sum + (s.frames / FPS) * VH_PER_SECOND + s.holdVh, 0)
@@ -102,6 +124,9 @@ export class FilmEngine {
   /** Scroll px where the footer's top edge reaches the top of the viewport. */
   private footerTop = Infinity
   private covered = false
+  private exitShift = 0
+  private exitShade = 0
+  private shade: HTMLElement | null = null
   private fallback: HTMLImageElement | null = null
   private holdLayer: HTMLCanvasElement | null = null
   private holdingFrame = false
@@ -141,7 +166,25 @@ export class FilmEngine {
   private ptrTarget = { x: 0, y: 0 }
   private ptr = { x: 0, y: 0 }
 
+  // decoded-frame canvas (WebCodecs path)
+  private canvas: HTMLCanvasElement | null = null
+  private ctx: CanvasRenderingContext2D | null = null
+  /** The one shared decoder, and each nearby clip's frames in it. */
+  private store: FrameStore | null = null
+  private tracks: (Clip | null)[] = SCENES.map(() => null)
+  private opening = new Set<number>()
+  private codecFailed: boolean[] = SCENES.map(() => false)
+  /** What the canvas holds: scene and (fractional) frame. Posters count as their first / last frame. */
+  private cv = { scene: -1, f: -1 }
+  private canvasFocus = ''
+  /** Displayed fractional frame: tracks the scroll while moving, settles on a whole frame at rest. */
+  private dispF = 0
+  private dispScene = -1
+  /** Mounted generation: async work from an earlier mount (StrictMode, HMR) is ignored. */
+  private gen = 0
+
   private clips: ClipState[] = SCENES.map((s) => ({
+    blob: null,
     blobUrl: null,
     attachedUrl: null,
     fetching: false,
@@ -173,10 +216,16 @@ export class FilmEngine {
   // motion state
   private targetY = 0
   private smoothY = 0
+  /** Film velocity, px/s (from the spring). */
+  private velocity = 0
+  /** Spring frequency (rad/s): lower = heavier, longer glide. Set by the input device. */
+  private omega = 10
+  /** Last direction of travel (1 forward, -1 back): decoding runs ahead of it. */
+  private dir = 1
+  private dt = 1 / 60
   private lastTs = 0
   private raf = 0
   private running = false
-  private stiffness = 6
   private active = -1
   private chapter = -1
   private stageScale = 1
@@ -232,6 +281,10 @@ export class FilmEngine {
   /** Poster still shown when the scene on screen has no decoded video frame yet. */
   registerFallback = (el: HTMLImageElement | null) => (this.fallback = el)
   registerHoldFrame = (el: HTMLCanvasElement | null) => (this.holdLayer = el)
+  /** The decoded-frame canvas (WebCodecs path). */
+  registerCanvas = (el: HTMLCanvasElement | null) => (this.canvas = el)
+  /** Darkens the film as the range section rises over it. */
+  registerShade = (el: HTMLElement | null) => (this.shade = el)
   registerStage = (el: HTMLElement | null) => (this.stage = el)
   /** The whole fixed film layer stack (videos, grade, snow, grain): dropped from compositing under the footer. */
   registerStageRoot = (el: HTMLElement | null) => (this.stageRoot = el)
@@ -260,14 +313,33 @@ export class FilmEngine {
   mount() {
     if (this.mounted) return
     this.mounted = true
+    this.gen++
     this.aborter = new AbortController()
+
+    if (this.codec && this.canvas) {
+      // Backing store at the clip's own resolution; CSS object-fit: cover scales it like the videos.
+      const [w, h] = this.variant === 'desktop' ? [1920, 1080] : [1280, 720]
+      this.canvas.width = w
+      this.canvas.height = h
+      this.ctx = this.canvas.getContext('2d', { alpha: false })
+    }
+    if (!this.ctx) this.codec = false
+    if (this.codec) {
+      const gen = this.gen
+      this.store = new FrameStore(
+        this.wake,
+        () => gen === this.gen && this.codecOff(),
+        (frames, ms) => gen === this.gen && this.decodeRate(frames, ms),
+      )
+    }
 
     if ('scrollRestoration' in history) history.scrollRestoration = 'manual'
 
     window.addEventListener('scroll', this.onScroll, { passive: true })
     window.addEventListener('resize', this.onResize, { passive: true })
     window.addEventListener('touchstart', this.onTouch, { passive: true })
-    window.addEventListener('wheel', this.onWheel, { passive: true })
+    // not passive: with a mouse or trackpad the engine glides the page itself (see onWheel)
+    window.addEventListener('wheel', this.onWheel, { passive: !this.glide })
     if (this.finePointer && !this.reduced) window.addEventListener('pointermove', this.onPointer, { passive: true })
 
     this.dataHandlers = this.videos.map((v, i) => {
@@ -321,10 +393,18 @@ export class FilmEngine {
     this.slow = false
     this.running = false
     this.aborter.abort()
+    this.tracks.forEach((t) => t?.release())
+    this.tracks = this.tracks.map(() => null)
+    this.store?.close()
+    this.store = null
+    this.opening.clear()
+    this.cv = { scene: -1, f: -1 }
+    this.dispScene = -1
     this.clips.forEach((c, i) => {
       if (c.blobUrl) URL.revokeObjectURL(c.blobUrl)
       clearTimeout(c.graceTimer)
       c.graceTimer = 0
+      c.blob = null
       c.blobUrl = c.attachedUrl = null
       c.fetching = false
       c.fetchAbort = null
@@ -343,6 +423,7 @@ export class FilmEngine {
     this.shown = -2
     this.holdingFrame = false
     if (this.holdLayer) this.holdLayer.style.opacity = '0'
+    if (this.canvas) this.canvas.style.opacity = '0'
   }
 
   /**
@@ -380,24 +461,50 @@ export class FilmEngine {
   // ───────────────────────────── input (cheap: store + wake)
 
   private onScroll = () => {
-    this.targetY = window.scrollY
+    const y = window.scrollY
+    // our own glide step: the target is already where it should be
+    if (this.driving && Math.abs(y - this.writtenY) < 2) return
+    // anything else (scrollbar, keys, find-in-page, an anchor) takes over until the next wheel
+    this.driving = false
+    this.targetY = y
     this.lastInput = performance.now()
     this.wake()
   }
   // touch already has native momentum — follow it closely
   private onTouch = () => {
     // Keep the film close to native touch momentum; a slow catch-up reads as judder on phones.
-    this.stiffness = 15
+    this.omega = 26
     this.lastInput = performance.now()
     // Retry the muted iOS decoder unlock inside a real touch gesture if autoplay was refused.
-    if (IS_IOS && this.active >= 0) this.primeClip(this.active)
+    if (IS_IOS && this.active >= 0 && !this.canvasClip(this.active)) this.primeClip(this.active)
   }
-  // wheel steps are coarse — ease them into a glide
-  private onWheel = () => {
-    // A shorter easing tail makes scrubbed footage respond immediately while retaining glide.
-    this.stiffness = 12
+  // wheel and trackpad input: a weighted glide, like a camera on a fluid head
+  private onWheel = (e: WheelEvent) => {
+    this.omega = 13
     this.lastInput = performance.now()
+    if (!this.glide || e.ctrlKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return // pinch-zoom, sideways
+    const root = document.documentElement
+    if (root.style.overflow === 'hidden' || root.classList.contains('is-loading')) return // menu / loader
+    // The page glides on the same spring as the film, so the range section, the scrollbar and the
+    // film move as one: a notched mouse wheel becomes one continuous move instead of 100 px jumps.
+    e.preventDefault()
+    const unit = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? this.vh : 1
+    const max = root.scrollHeight - this.vh
+    if (!this.driving) {
+      this.driving = true
+      this.targetY = window.scrollY
+    }
+    this.targetY = Math.min(Math.max(this.targetY + e.deltaY * unit, 0), max)
+    this.wake()
   }
+  /**
+   * Mouse / trackpad: the engine scrolls the page (touch keeps native momentum; reduced motion keeps
+   * native; `?native` turns it off for comparison).
+   */
+  private readonly glide = this.finePointer && !this.reduced && !QUERY.has('native')
+  /** The engine is currently moving the page (until another kind of scroll takes over). */
+  private driving = false
+  private writtenY = -1
   private onPointer = (e: PointerEvent) => {
     this.ptrTarget.x = (e.clientX / this.vw) * 2 - 1
     this.ptrTarget.y = (e.clientY / this.vh) * 2 - 1
@@ -486,14 +593,45 @@ export class FilmEngine {
   jumpTo(sceneIndex: number, local: number) {
     const top = Math.round(this.localToPx(sceneIndex, local))
     const near = Math.abs(sceneIndex - this.active) <= 1
-    if (near && !this.reduced) {
+    if (!this.reduced) this.preloadPosters(sceneIndex) // the landing frame's still, in case it beats the decoder
+    if (near && this.glide) {
+      // the film's own spring carries the page there, slower than a wheel move: a camera move
+      this.driving = true
+      this.omega = 6
+      this.targetY = top
+      this.wake()
+    } else if (near && !this.reduced) {
       window.scrollTo({ top, behavior: 'smooth' })
     } else {
       // Long jumps snap: scrubbing through a dozen clips would just be noise.
+      this.driving = false
       window.scrollTo({ top, behavior: 'instant' as ScrollBehavior })
       this.targetY = this.smoothY = top
+      this.velocity = 0
       this.wake()
     }
+  }
+
+  /**
+   * "The Range": from far away, cut to just above the section (gliding through the whole film
+   * would be a smear), then glide the last stretch in on the film's spring.
+   */
+  toRange = () => {
+    const el = document.getElementById('range')
+    if (!el) return
+    const top = Math.round(el.getBoundingClientRect().top + window.scrollY - (parseFloat(getComputedStyle(el).scrollMarginTop) || 0))
+    if (!this.glide) return window.scrollTo({ top, behavior: this.reduced ? ('instant' as ScrollBehavior) : 'smooth' })
+    if (Math.abs(top - window.scrollY) > this.vh * 3) {
+      const from = Math.round(top - this.vh * 1.4)
+      this.writtenY = from // the scroll event this causes is ours
+      window.scrollTo({ top: from, behavior: 'instant' as ScrollBehavior })
+      this.smoothY = from
+      this.velocity = 0
+    }
+    this.driving = true
+    this.omega = 6
+    this.targetY = top
+    this.wake()
   }
 
   /**
@@ -531,11 +669,30 @@ export class FilmEngine {
   private tick = (ts: number) => {
     const dt = Math.min((ts - this.lastTs) / 1000, 0.1)
     this.lastTs = ts
+    this.dt = dt
 
-    // Ease toward the scroll target. exp() makes the glide identical at 60/120/144 Hz.
-    const gap = this.targetY - this.smoothY
-    if (this.reduced || Math.abs(gap) < 0.5) this.smoothY = this.targetY
-    else this.smoothY += gap * (1 - Math.exp(-dt * this.stiffness))
+    // Follow the scroll target on a critically damped spring. Unlike an exponential chase (full
+    // speed on the first frame) it eases in as well as out and never overshoots: the film starts
+    // and stops like a camera move. The analytic step makes the glide identical at 60/120/144 Hz.
+    const x = this.smoothY - this.targetY
+    if (this.reduced || (Math.abs(x) < 0.5 && Math.abs(this.velocity) < 8)) {
+      this.smoothY = this.targetY
+      this.velocity = 0
+    } else {
+      const w = this.omega
+      const e = Math.exp(-w * dt)
+      const c = this.velocity + w * x
+      this.smoothY = this.targetY + (x + c * dt) * e
+      this.velocity = (this.velocity - c * w * dt) * e
+      if (Math.abs(this.velocity) > 30) this.dir = this.velocity > 0 ? 1 : -1
+    }
+    if (this.driving) {
+      const y = Math.round(this.smoothY)
+      if (y !== this.writtenY) {
+        this.writtenY = y
+        window.scrollTo(0, y)
+      }
+    }
 
     // pointer eases with a soft spring-like lag, so depth planes feel weighted
     const pk = 1 - Math.exp(-dt * 4.5)
@@ -543,8 +700,8 @@ export class FilmEngine {
     this.ptr.y += (this.ptrTarget.y - this.ptr.y) * pk
     const ptrMoving = Math.abs(this.ptrTarget.x - this.ptr.x) + Math.abs(this.ptrTarget.y - this.ptr.y) > 0.002
 
-    const settledVideo = this.render(this.smoothY, ts)
     this.coverCheck()
+    const settledVideo = this.render(this.smoothY, ts)
 
     if (this.smoothY !== this.targetY || !settledVideo || ptrMoving) {
       this.raf = requestAnimationFrame(this.tick)
@@ -559,7 +716,22 @@ export class FilmEngine {
    * opaque page every frame while the visitor browses the range.
    */
   private coverCheck() {
-    const covered = this.targetY >= this.footerTop + 2
+    // While the range rises over the last frame, the film sinks away behind it: it travels at a
+    // third of the page's speed and dims, so the footer reads as a layer in front, not a cut.
+    // Follows the page's real scroll position so it stays locked to the footer's edge (the spring
+    // when the engine is gliding the page, the native position otherwise).
+    const docY = this.driving ? this.smoothY : this.targetY
+    const exit = clamp01((docY - (this.footerTop - this.vh)) / this.vh)
+    const shift = this.reduced ? 0 : Math.round(exit * this.vh * 0.32 * 10) / 10
+    const shade = Math.round(exit * 0.72 * 100) / 100
+    if (shift !== this.exitShift || shade !== this.exitShade) {
+      this.exitShift = shift
+      this.exitShade = shade
+      if (this.stageRoot) this.stageRoot.style.transform = shift ? `translate3d(0,${-shift}px,0)` : ''
+      if (this.shade) this.shade.style.opacity = String(shade)
+    }
+
+    const covered = docY >= this.footerTop + 2
     if (covered === this.covered) return
     this.covered = covered
     // opacity, not visibility: children that set visibility: visible would still be drawn, and a
@@ -591,19 +763,27 @@ export class FilmEngine {
 
     let settled = true
     if (!this.reduced) {
-      const frames = this.clips[i].frames
-      settled = this.seek(i, Math.round(p * (frames - 1)))
-      // keep neighbours parked on their boundary frames so the hand-off is instant in either direction
-      // Never seek a visible outgoing layer in the background: some browsers clear it to black
-      // for the duration of the seek, exactly when it is serving as the transition hold frame.
-      if (i + 1 < this.scenes.length && i + 1 !== this.shown) this.seek(i + 1, 0)
-      if (i > 0 && i - 1 !== this.shown) this.seek(i - 1, this.clips[i - 1].frames - 1)
-      this.present(i, p)
+      if (this.canvasClip(i)) {
+        settled = this.presentCanvas(i, p)
+      } else {
+        const frames = this.clips[i].frames
+        settled = this.seek(i, Math.round(p * (frames - 1)))
+        // keep neighbours parked on their boundary frames so the hand-off is instant in either direction
+        // Never seek a visible outgoing layer in the background: some browsers clear it to black
+        // for the duration of the seek, exactly when it is serving as the transition hold frame.
+        if (i + 1 < this.scenes.length && i + 1 !== this.shown) this.seek(i + 1, 0)
+        if (i > 0 && i - 1 !== this.shown) this.seek(i - 1, this.clips[i - 1].frames - 1)
+        this.present(i, p)
+      }
     }
 
     // Hold "breathing": a slow push-in and back while the clip rests on its hero frame.
     // The slow push-in is intentional on desktop; on iPhone it reads as an unwanted zoom.
-    const scale = h > 0 && !this.reduced && !IS_IOS ? 1 + 0.028 * Math.sin(Math.PI * h) : 1
+    const breathe = h > 0 && !this.reduced && !IS_IOS ? 1 + 0.028 * Math.sin(Math.PI * h) : 1
+    // Speed push: the frame leans in a touch while the film moves fast, like a camera on a dolly.
+    // Mouse / trackpad only; on touch the finger is already the camera.
+    const push = this.finePointer && !this.reduced ? Math.min(Math.abs(this.velocity) / (this.vh * 5), 1) * 0.016 : 0
+    const scale = breathe * (1 + push)
     if (this.stage && Math.abs(scale - this.stageScale) > 0.0002) {
       this.stageScale = scale
       this.stage.style.transform = scale === 1 ? '' : `scale3d(${scale.toFixed(4)},${scale.toFixed(4)},1)`
@@ -701,9 +881,12 @@ export class FilmEngine {
       this.toneLayer.style.opacity = String(tone)
     }
 
-    // the type layer drifts opposite the pointer by a few px — it reads as sitting in front of the footage
-    if (this.captionLayer && this.finePointer && !this.reduced) {
-      const shift = `translate3d(${(this.ptr.x * -7).toFixed(1)}px,${(this.ptr.y * -5).toFixed(1)}px,0)`
+    // the type layer drifts opposite the pointer by a few px — it reads as sitting in front of the
+    // footage — and sinks with the film as the range section rises over it
+    if (this.captionLayer && !this.reduced) {
+      const px = this.finePointer ? this.ptr.x * -7 : 0
+      const py = (this.finePointer ? this.ptr.y * -5 : 0) - this.exitShift
+      const shift = px || py ? `translate3d(${px.toFixed(1)}px,${py.toFixed(1)}px,0)` : ''
       if (shift !== this.capShift) {
         this.capShift = shift
         this.captionLayer.style.transform = shift
@@ -788,7 +971,8 @@ export class FilmEngine {
 
   /**
    * Only a few <video> elements hold a source at once (decoder memory — iOS is strict about this).
-   * Window: previous, current, next two. Anything further away is detached.
+   * Window: previous, current, next two. Anything further away is detached. On the canvas path a
+   * <video> is only used to stream a clip that hasn't downloaded yet.
    */
   private updateWindow(i: number) {
     this.clips.forEach((c, k) => {
@@ -796,8 +980,264 @@ export class FilmEngine {
       const keep = this.roomy || (k >= i - 2 && k <= i + 3) // hysteresis so scrolling back and forth doesn't thrash
       if (want) this.attach(k)
       else if (!keep && c.attachedUrl && k !== this.shown) this.detach(k)
+      // drawn from its decoder now: the stream that covered for the download can go
+      if (c.attachedUrl && k !== this.shown && this.canvasClip(k)) this.detach(k)
     })
+    this.syncDecoders(i)
     this.scheduleWarm()
+  }
+
+  // ───────────────────────────── decoded frames (WebCodecs → canvas)
+
+  /** This clip is drawn on the canvas from its decoder (else: its <video>, or a poster). */
+  private canvasClip(k: number) {
+    return this.codec && !this.codecFailed[k] && !!this.clips[k]?.blob
+  }
+
+  /**
+   * Clips are read into the shared decoder for the scene on screen and its two neighbours, and
+   * released two scenes away (so scrolling back and forth across a cut doesn't re-read them).
+   * Each one's cache is sized by role: the playhead's scene keeps a few GOPs; a neighbour keeps
+   * only the GOP at the shared cut.
+   */
+  private syncDecoders(i: number) {
+    this.tracks.forEach((clip, k) => {
+      const d = Math.abs(k - i)
+      if (clip && (!this.codec || d > 2)) {
+        clip.release()
+        this.tracks[k] = null
+      } else if (d <= 1) this.openTrack(k)
+      this.sizeCache(k)
+    })
+  }
+
+  private sizeCache(k: number) {
+    const clip = this.tracks[k]
+    const i = this.active
+    if (!clip) return
+    if (k === i) {
+      // phones and tablets get one GOP less (memory); 1080p frames are ~8 MB each
+      clip.setCap(clip.gop * (IS_IOS || this.variant === 'mobile' ? 2 : 3))
+    } else if (k === i + 1) {
+      clip.focus = 0
+      clip.setCap(clip.gopLength(0))
+    } else if (k === i - 1) {
+      clip.focus = clip.frames - 1
+      clip.setCap(this.tailGops(clip).reduce((n, g) => n + clip.gopLength(g), 0))
+    } else clip.setCap(0)
+  }
+
+  /** The GOPs at a clip's end cut: the last one, plus the one before when the last is only a frame or two. */
+  private tailGops(clip: Clip) {
+    const last = clip.lastGop
+    return last > 0 && clip.gopLength(last) < clip.gop / 2 ? [last, last - 1] : [last]
+  }
+
+  private openTrack(k: number) {
+    const c = this.clips[k]
+    const store = this.store
+    if (!store || !this.canvasClip(k) || this.tracks[k] || this.opening.has(k)) return
+    this.opening.add(k)
+    const gen = this.gen
+    store.open(c.blob!).then(
+      (clip) => {
+        if (gen !== this.gen) return
+        this.opening.delete(k)
+        if (!this.canvasClip(k) || Math.abs(k - this.active) > 2) return
+        this.tracks[k] = clip
+        this.sizeCache(k)
+        this.wake()
+      },
+      () => {
+        if (gen !== this.gen) return
+        this.opening.delete(k)
+        this.trackFailed(k)
+      },
+    )
+  }
+
+  /**
+   * Throughput guard. Apple silicon, recent iPhones and current PC GPUs decode these clips at
+   * several hundred frames a second; a machine that manages under ~45 can't keep the canvas fed
+   * while scrubbing, and the decoding would compete with drawing. There, the <video> path (which
+   * only decodes the frames it lands on) is the better experience.
+   */
+  private decodeRate(frames: number, ms: number) {
+    if (!this.codec || frames < 12 || ms <= 0) return
+    const fps = (frames * 1000) / ms
+    this.rateEma = this.rateSamples++ ? this.rateEma * 0.6 + fps * 0.4 : fps
+    if (this.rateSamples >= 3 && this.rateEma < 45) this.codecOff()
+  }
+  private rateEma = 0
+  private rateSamples = 0
+
+  /** The canvas path is off for the rest of the visit: every clip goes back to its <video>. */
+  private codecOff() {
+    if (!this.codec) return
+    this.codec = false
+    if (this.active >= 0) this.updateWindow(this.active) // releases the clips, attaches the videos
+    this.store?.close()
+    this.wake()
+  }
+
+  /** A clip this browser can't decode goes back to its <video>; two such clips and the canvas path is off. */
+  private trackFailed(k: number) {
+    if (this.codecFailed[k]) return
+    this.codecFailed[k] = true
+    this.tracks[k]?.release()
+    this.tracks[k] = null
+    if (this.codecFailed.filter(Boolean).length >= 2) return this.codecOff()
+    if (this.active >= 0) this.updateWindow(this.active)
+    this.wake()
+  }
+
+  /**
+   * Canvas path: puts the best available picture for this scroll position on screen, this frame.
+   *  · decoded: the exact frame, with the next one cross-faded in by the fractional position, so
+   *    slow scrolling glides instead of stepping at 24 fps. At rest it settles on a whole frame.
+   *  · still decoding: whichever is closest to the right picture of the nearest decoded frame, the
+   *    scene's first / last poster, or what the canvas already shows (a cut's shared boundary frame
+   *    counts as both scenes'). The canvas keeps its pixels until something better is drawn.
+   * Returns false while the cross-fade is still settling; decoded frames and posters wake the loop.
+   */
+  private presentCanvas(i: number, p: number): boolean {
+    this.setWaiting(false) // in memory: nothing is waiting on the network
+    const dec = this.tracks[i]
+    const n = dec?.frames ?? this.clips[i].frames
+    const F = p * (n - 1)
+
+    let easing = false
+    if (this.dispScene !== i || this.smoothY !== this.targetY) this.dispF = F
+    else {
+      const to = Math.round(F)
+      const d = to - this.dispF
+      if (Math.abs(d) < 0.01) this.dispF = to
+      else {
+        this.dispF += d * (1 - Math.exp(-this.dt * 12))
+        easing = true
+      }
+    }
+    this.dispScene = i
+    const at = this.dispF
+    const f0 = Math.min(Math.floor(at), n - 1)
+    const f1 = Math.min(f0 + 1, n - 1)
+    const w = at - f0
+
+    if (dec) {
+      dec.focus = at
+      const g = dec.gopOf(f0)
+      // The decoder serves this scene first, then the neighbour in the direction of travel. The
+      // neighbours want the GOPs at this scene's cuts, so a cut is instant either way.
+      const next = this.tracks[i + 1]
+      const prev = this.tracks[i - 1]
+      if (next) next.want = [0]
+      if (prev) prev.want = this.tailGops(prev)
+      this.store!.order = [dec, this.tracks[i + this.dir] ?? null, this.tracks[i - this.dir] ?? null]
+      // The playhead's GOP, the cross-fade partner's, one ahead of the travel; and one behind only
+      // when moving slowly enough to change direction (at speed it would be decoded for nothing).
+      const slow = Math.abs(this.velocity) < this.vh
+      dec.request(slow ? [g, dec.gopOf(f1), g + this.dir, g - this.dir] : [g, dec.gopOf(f1), g + this.dir])
+      if (dec.has(f0)) {
+        // Once the film passes more than a footage frame per screen refresh, every refresh shows a
+        // new frame anyway: the cross-fade would cost a second full-size draw for nothing.
+        const perRefresh = (Math.abs(this.velocity) * this.dt * (n - 1)) / this.scrubPx[i]
+        const blend = perRefresh < 1 && w > 0.01 && f1 !== f0 && dec.has(f1)
+        this.paint(i, dec, f0, blend ? f1 : -1, w)
+        return !easing
+      }
+    }
+
+    // A streamed <video> of this scene that covered for its download stays up until frames decode.
+    if (this.shown === i && this.clips[i].hasFrame) {
+      this.seek(i, Math.round(F))
+      return true
+    }
+
+    let keep = Infinity
+    if (this.shown === CANVAS) {
+      const cv = this.cv
+      const prevLast = (this.tracks[i - 1]?.frames ?? this.clips[i - 1]?.frames ?? 0) - 1
+      if (cv.scene === i) keep = Math.abs(cv.f - at)
+      else if (cv.scene === i - 1 && cv.f >= prevLast) keep = at
+      else if (cv.scene === i + 1 && cv.f <= 0) keep = n - 1 - at
+    }
+    const near = dec ? dec.nearest(at) : -1
+    const dNear = near >= 0 ? Math.abs(near - at) : Infinity
+    const first = this.poster(i, 'first')
+    const last = this.poster(i, 'last')
+    const dFirst = first ? at : Infinity
+    const dLast = last ? n - 1 - at : Infinity
+    const best = Math.min(dNear, dFirst, dLast)
+    if (best >= keep || best === Infinity) return true
+    if (best === dNear) this.paint(i, dec!, near, -1, 0)
+    else if (best === dFirst) this.paintStill(i, first!, 0)
+    else this.paintStill(i, last!, n - 1)
+    return true
+  }
+
+  /** Draws decoded frame f0, with f1 cross-faded over it at weight w. Skips the draw if unchanged. */
+  private paint(i: number, dec: Clip, f0: number, f1: number, w: number) {
+    const ctx = this.ctx!
+    const a = f1 >= 0 ? Math.round(w * 48) / 48 : 0
+    const f = f0 + a
+    if (this.cv.scene !== i || this.cv.f !== f || this.shown !== CANVAS) {
+      const { width, height } = this.canvas!
+      ctx.globalAlpha = 1
+      ctx.drawImage(dec.get(f0)!, 0, 0, width, height)
+      if (a > 0) {
+        ctx.globalAlpha = a
+        ctx.drawImage(dec.get(f1)!, 0, 0, width, height)
+        ctx.globalAlpha = 1
+      }
+      this.cv.scene = i
+      this.cv.f = f
+    }
+    this.showCanvas(i)
+  }
+
+  /** Draws a poster still (a scene's first or last frame) onto the canvas. */
+  private paintStill(i: number, img: HTMLImageElement, frame: number) {
+    const { width, height } = this.canvas!
+    this.ctx!.globalAlpha = 1
+    this.ctx!.drawImage(img, 0, 0, width, height)
+    this.cv.scene = i
+    this.cv.f = frame
+    this.showCanvas(i)
+  }
+
+  private showCanvas(i: number) {
+    const focus = `${(this.scenes[i].focusX ?? 0.5) * 100}% 50%`
+    if (focus !== this.canvasFocus) {
+      this.canvasFocus = focus
+      this.canvas!.style.objectPosition = focus
+    }
+    this.reveal(CANVAS)
+  }
+
+  /** A scene's decoded poster image (or undefined, and it starts loading; its arrival wakes the loop). */
+  private poster(i: number, side: 'first' | 'last') {
+    const src = posterUrl(this.scenes[i].file, side)
+    const img = this.posterImgs.get(src)
+    if (!img) this.preloadPoster(src)
+    return img
+  }
+
+  /**
+   * Swaps the visible layer: a video (index), the poster still (-1) or the canvas. The incoming
+   * layer is revealed before the outgoing one is hidden, so nothing empty is ever composited.
+   */
+  private reveal(target: number) {
+    if (target === this.shown) return
+    const layer = (k: number) => (k === CANVAS ? this.canvas : k === -1 ? this.fallback : k >= 0 ? this.videos[k] : null)
+    const incoming = layer(target)
+    const outgoing = layer(this.shown)
+    if (incoming) incoming.style.opacity = '1'
+    if (outgoing) outgoing.style.opacity = '0'
+    if (this.holdingFrame && this.holdLayer) {
+      this.holdLayer.style.opacity = '0'
+      this.holdingFrame = false
+    }
+    this.shown = target
   }
 
   /**
@@ -818,7 +1258,7 @@ export class FilmEngine {
       const from = Math.max(this.active, 0)
       let best = -1
       this.clips.forEach((c, k) => {
-        if (!c.blobUrl || c.attachedUrl) return
+        if (!c.blob || c.attachedUrl) return
         if (best < 0 || Math.abs(k - from) + (k < from ? 0.5 : 0) < Math.abs(best - from) + (best < from ? 0.5 : 0)) best = k
       })
       if (best < 0) return // everything downloaded is warm; a landing download re-schedules
@@ -836,11 +1276,12 @@ export class FilmEngine {
   private attach(k: number) {
     const c = this.clips[k]
     const v = this.videos[k]
-    if (!v) return
+    if (!v || this.canvasClip(k)) return // drawn from its decoder: no <video> needed
     // Prefer the in-memory copy. While it's still downloading, show the poster rather than
     // streaming: a streamed clip turns every scrub step into a network range request.
     // The network URL is only used if the download failed or the user outran it (streamFallback).
     const streamOk = c.failed || (c.streamFallback && (k === this.active || (k === this.active + 1 && this.activeSatisfied())))
+    if (c.blob && !c.blobUrl) c.blobUrl = URL.createObjectURL(c.blob)
     const url = c.blobUrl ?? (streamOk ? clipUrl(this.variant, this.scenes[k].file) : null)
     if (!url || c.attachedUrl === url) return
     // Upgrading a clip that is on screen (active, or held as the last good picture) from
@@ -1019,18 +1460,7 @@ export class FilmEngine {
       // can blank it while the browser re-requests (e.g. cache disabled / evicted).
       this.usePoster(i, p < 0.5 ? 'first' : 'last')
     }
-    if (target === this.shown) return
-    // reveal the incoming layer before hiding the outgoing one, so nothing empty is ever composited
-    if (target === -1) {
-      if (this.fallback) this.fallback.style.opacity = '1'
-    } else this.videos[target].style.opacity = '1'
-    if (this.shown >= 0) this.videos[this.shown].style.opacity = '0'
-    else if (this.shown === -1 && this.fallback) this.fallback.style.opacity = '0'
-    if (this.holdingFrame && this.holdLayer) {
-      this.holdLayer.style.opacity = '0'
-      this.holdingFrame = false
-    }
-    this.shown = target
+    this.reveal(target)
   }
 
   /** Point the persistent still layer at an already-decoded poster. */
@@ -1054,10 +1484,10 @@ export class FilmEngine {
    */
   private scheduleStream(k: number) {
     const c = this.clips[k]
-    if (!c || c.attachedUrl || c.blobUrl || c.graceTimer) return
+    if (!c || c.attachedUrl || c.blob || c.graceTimer) return
     const decide = () => {
       c.graceTimer = 0
-      if (!this.mounted || c.attachedUrl || c.blobUrl) return
+      if (!this.mounted || c.attachedUrl || c.blob) return
       if (k === 0 && !this.loadState.ready) return // the intro gate handles the first clip
       const next = k === this.active + 1
       if (k !== this.active && !next) return // the viewer already moved on
@@ -1158,10 +1588,10 @@ export class FilmEngine {
     return Math.min(c.loaded / c.total, 1)
   }
 
-  /** The scene on screen has decoded footage (from memory or its stream). */
+  /** The scene on screen has footage: in memory for its decoder, or a stream showing frames. */
   private activeSatisfied() {
     const c = this.clips[this.active]
-    return !!c && !!c.attachedUrl && c.hasFrame
+    return !!c && (this.canvasClip(this.active) || (!!c.attachedUrl && c.hasFrame))
   }
 
   /** Cancels downloads of clips the viewer has already scrolled past, so bandwidth goes ahead. */
@@ -1264,7 +1694,7 @@ export class FilmEngine {
       let best = -1
       let bestScore = Infinity
       this.clips.forEach((c, k) => {
-        if (c.blobUrl || c.fetching || c.failed) return
+        if (c.blob || c.fetching || c.failed) return
         const d = k - from
         const score = d >= 0 ? d : -d * 2.5 // prefer what's ahead of the viewer
         if (score < bestScore) {
@@ -1306,13 +1736,16 @@ export class FilmEngine {
       },
       own.signal,
     )
-      .then((blobUrl) => {
-        if (root.aborted) return URL.revokeObjectURL(blobUrl)
-        c.blobUrl = blobUrl
+      .then((blob) => {
+        if (root.aborted) return
+        c.blob = blob
         this.measureSpeed(c)
-        // attach now if it's inside the decode window (upgrades an off-screen streamed source too)
-        if (k >= this.active - 1 && k <= this.active + 2) this.attach(k)
-        else this.scheduleWarm()
+        // Inside the window: open its decoder (canvas path) or attach it (upgrades an off-screen
+        // streamed source too).
+        if (k >= this.active - 1 && k <= this.active + 2) {
+          this.attach(k)
+          this.syncDecoders(this.active)
+        } else this.scheduleWarm()
         if (k === 0) this.setLoad(1, true)
       })
       .catch(() => {

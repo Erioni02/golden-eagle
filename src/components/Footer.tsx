@@ -42,7 +42,12 @@ export function Footer({ engine }: { engine: FilmEngine }) {
   }, [])
 
   return (
-    <footer ref={root} className="relative z-20 overflow-hidden bg-ink">
+    <footer ref={root} className="relative z-20 overflow-x-clip bg-ink">
+      {/* feathered top edge: the film fades into the page instead of meeting a hard line */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-0 bottom-full h-[26vh] bg-[linear-gradient(to_bottom,transparent,rgb(5_5_5/0.55)_55%,var(--color-ink))]"
+      />
       {/* soft gold light spilling down from the last frame of the film */}
       <div
         aria-hidden="true"

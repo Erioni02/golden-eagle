@@ -28,6 +28,10 @@ npm run preview    # serve dist/ locally
 - **Depth planes.** Two snow layers at different distances drift over the opening and closing summit and respond to scroll and the pointer. The type layer also shifts slightly against the pointer.
 - **Flavor light.** During each flavor's hold, that flavor's colour spills onto the interface side of the frame and retints the progress rail.
 - **Film HUD.** A rolling timecode (transform-only digits) and chapter ticks.
+- **Camera weight.** The film follows the scroll on a critically damped spring: it eases in and out like a camera move and never overshoots. With a mouse or trackpad the frame leans in by up to 1.6% at speed, like a dolly push.
+- **Frame blending.** Between two whole frames the next one is cross-faded in by the scroll position, so slow scrolling glides instead of stepping at 24 fps. At rest it settles on a single frame.
+- **Page glide.** With a mouse or trackpad the engine moves the page itself, on the same spring as the film, so a notched wheel becomes one continuous move and the range section glides like the film. Touch keeps native momentum. "The Range" and chapter jumps ride the same spring, slower.
+- **Parallax exit.** As the range section rises, the last frame sinks behind it at a third of the page's speed and dims under a feathered edge.
 
 **Copy rules:**
 - No em dashes.
@@ -55,7 +59,8 @@ Tested at 320×568, 390×844, 430×932, 844×390, 768×1024, 820×1180, 1024×76
 | Path | What it is |
 |---|---|
 | `src/film/scenes.ts` | **The film as data**: clip order, hold lengths, chapter names, all captions and flavor copy. Edit text here. |
-| `src/film/FilmEngine.ts` | Scroll → video engine (single rAF loop, seeking, captions, decode window, loading) |
+| `src/film/FilmEngine.ts` | Scroll → film engine (single rAF loop, spring, canvas / video presentation, captions, decode window, loading) |
+| `src/film/decoder.ts` | WebCodecs path: a small MP4 demuxer, one shared GOP-streaming decoder, and each clip's bitmap cache around the playhead |
 | `src/film/media.ts` | Clip URLs, desktop/mobile variant choice, Blob download with progress |
 | `src/components/*` | Stage (videos, snow planes, flavor light, grain), Captions, Title (word reveals), Letterbox, Nav (island + full-screen menu), Rail (timecode HUD), PartnerBadge, Loader, Footer (range grid + close) |
 | `public/media/desktop/` | 1080p clips, GOP 8, no B-frames (77 MB total) |
@@ -89,23 +94,53 @@ The "AI generated" text is removed in the encode (ffmpeg `delogo` plus a feather
 
 ## Performance notes
 
-- **The scroll handler only stores `scrollY`.** One rAF loop eases toward it (frame-rate-independent exponential smoothing) and sleeps when settled.
+- **Input handlers only store a target** (`scrollY`, or the wheel's running total while the engine glides the page). One rAF loop follows it on a critically damped spring (an analytic step, so the glide is identical at 60/120/144 Hz), writes the page position when gliding, and sleeps when settled.
+- **Every screen refresh shows a new, exact frame.** Frames are decoded with WebCodecs and drawn on a canvas in every browser that has it. A seeked `<video>` can only change its picture as fast as seeks complete, one at a time. Measured in Chrome, that was every other refresh at a normal scrolling speed, and in Safari far worse (stutter, blanking, seconds of black after a jump). The `<video>` path remains as the fallback.
+- **QA switches** (add to the URL): `?video` forces the `<video>` path, `?native` turns off the page glide, `?debug` exposes the engine as `window.__film` on a production build.
+
+### Canvas path (WebCodecs)
+
+- **One decoder for the whole film.** Each downloaded clip is demuxed in the browser (`decoder.ts`, no library), and a single hardware decoder, created once under the loader, streams GOPs from any clip. The bitstream is fed as Annex B with the clip's SPS/PPS in front of every keyframe, so switching clips needs no reconfiguration. A decoder per scene used to stall Chrome's GPU thread for ~170 ms at every cut and allocate a fresh set of picture buffers each time.
+- **Frames near the playhead are kept as `ImageBitmap` copies,** so the engine draws the exact frame in the same rAF it asks for it, and the decoder gets its own buffers straight back. Holding the decoder's `VideoFrame`s instead starved it to 4 fps.
+- **The canvas never goes black.** It keeps its pixels until something better is drawn. While a GOP decodes, it shows whichever is closest to the right picture: the nearest decoded frame, the scene's first or last poster, or what it already holds (a cut's shared frame counts for both scenes). Long jumps land on the poster of the exact landing frame within one or two rAFs.
+- **The decoder is kept streaming.** At most two GOPs are in flight, served in priority order: the scene on screen first, then the neighbour in the direction of travel. It's never flushed mid-stream (a flush drains the whole pipeline, and flushing after every GOP cut throughput to a quarter), only once everything wanted has been fed. The GOP behind the playhead is only decoded when moving slowly enough to turn around. Past one footage frame per refresh the cross-fade is skipped, since every refresh shows a new frame anyway.
+- **Memory is bounded by role.** The scene on screen keeps three GOPs (two on phones and tablets). Its neighbours keep only the GOP at the shared cut, so crossing a cut in either direction is instant. Clips are released two scenes away. At 1080p the total is about 40 bitmaps (~330 MB of GPU memory); at 720p about 26 (~100 MB).
+- **Safety nets.** A clip that can't be read falls back to its `<video>`. Two such clips, a decoder that fails repeatedly, or measured throughput under 45 frames/s switch the visit to the `<video>` path. A decoder the browser reclaims (idle background tab) is rebuilt quietly.
+
+Smoothness benchmark (production build, headless Chrome on an Intel Iris Xe laptop, 1440×900, whole film; "fresh" = refreshes where the picture changed while the film was moving):
+
+| Pass | `<video>` path: fresh / dropped | Canvas path: fresh / dropped |
+|---|---|---|
+| 900 px/s | 47% / 1 of ~1,000 | 100% / 3 of ~1,000 |
+| 1800 px/s forward | 79% / 0–1 of ~1,480 | 100% / 11 of ~1,480 |
+| 1800 px/s back | 78% / 0–2 of ~1,480 | 100% / 9 of ~1,480 |
+
+The canvas path is also exact (mean error 0.01 frames when blending), and a fast flick that rendered 30 frames in 4 s with one decoder per scene renders 215 with the shared decoder.
+
+Real wheel input (CDP, 100 px notches): with the page glide, the page moves in ~13 px steps with an unevenness of 1.2 px between consecutive steps, against 100 px jumps natively. A trackpad-style flick goes from 13.2 to 0.7.
+
+### `<video>` path (no WebCodecs, or fallback)
+
 - **Video seeks happen only when the target frame changes,** never while a seek is in flight, and always to the middle of the frame. Neighbouring clips are parked on their boundary frames, so the hand-off between clips is invisible.
-- **Clips are downloaded whole into memory (Blob → object URL),** nearest-ahead first, two at a time, so seeking never waits on network range requests. A clip falls back to streaming if a download fails or stalls.
 - **The screen is never empty.** A clip is only shown once it has decoded a frame. Until then the engine holds the neighbouring clip's matching boundary frame, or the scene's poster still (posters are pre-decoded and swapped in as elements, so they never blank).
-- **Outrunning the downloads degrades to streaming, not black.** If the scene on screen hasn't downloaded yet (and won't land within ~1.5 s, judged from live download progress), it streams immediately with priority: its duplicate download is cancelled and background prefetches pause until it shows a frame. Downloads of clips already scrolled past are cancelled. The next scene pre-streams only once the current one is satisfied.
-- **Slow connections are named, not hidden.** If the scene on screen has waited on the network for 0.9 s, a small glass notice under the nav says "Your connection is slow" with the download progress (`NetworkNotice.tsx`). It clears once footage has flowed for 2 s, never shows on a good line, and is announced once to screen readers.
 - **No more than five `<video>` elements hold a source at once on phones and iOS,** to keep decoder memory in check. On desktop-class devices every downloaded clip stays attached instead: attaching or detaching a source spins a hardware decoder up or down and stalls the compositor for 100–180 ms, so it happens once per clip, only while the viewer is at rest, and never at a scene boundary mid-scroll.
-- **GPU warm-up under the loader.** Every glass card and the flavor light are composited once at near-zero opacity while the loader is up. The first backdrop-blur draw otherwise costs a 250 ms+ stall, which used to land on the first flavor.
-- **Nothing is drawn behind the footer.** Once the range section fills the viewport, the film layers drop to opacity 0 and the compositor skips them (no decoder teardown, so coming back up is instant). Footer reveals animate only `opacity` and `transform`.
-- **Clips use a short keyframe interval with no B-frames,** so a random seek decodes at most 7 frames (the raw files had one keyframe per clip).
-- **Captions animate only `opacity` and `transform`,** and each value is written only when it changes. React never re-renders per frame.
-- **Liquid glass (`backdrop-filter`) is limited to small surfaces:** the nav, badge and cards.
-- `prefers-reduced-motion` shows still frames per scene with no video downloads, and captions don't move.
 
 Measured on a production build with headless Chrome while scrubbing: about 0.4 ms of script and 0.4 ms of style work per frame, layout close to zero, no long tasks, and a 2.2 MB JS heap.
 
 Whole-film scroll test (production build, Chrome, 1440×900, forward and back at 1800 px/s plus a slow 700 px/s pass): 1 dropped frame out of about 7,000, worst frame 33 ms. Before the decoder and warm-up changes the slow pass alone dropped 65 frames with stalls up to 350 ms.
+
+### Both paths
+
+- **Clips are downloaded whole into memory (Blob),** nearest-ahead first, two at a time, so a frame never waits on a network range request. A clip falls back to streaming through its `<video>` if a download fails or stalls.
+- **Outrunning the downloads degrades to streaming, not black.** If the scene on screen hasn't downloaded yet (and won't land within ~1.5 s, judged from live download progress), it streams immediately with priority: its duplicate download is cancelled and background prefetches pause until it shows a frame. Downloads of clips already scrolled past are cancelled. The next scene pre-streams only once the current one is satisfied.
+- **Slow connections are named, not hidden.** If the scene on screen has waited on the network for 0.9 s, a small glass notice under the nav says "Your connection is slow" with the download progress (`NetworkNotice.tsx`). It clears once footage has flowed for 2 s, never shows on a good line, and is announced once to screen readers.
+- **GPU warm-up under the loader.** Every glass card and the flavor light are composited once at near-zero opacity while the loader is up. The first backdrop-blur draw otherwise costs a 250 ms+ stall, which used to land on the first flavor.
+- **Nothing is drawn behind the footer.** Once the range section fills the viewport, the film layers drop to opacity 0 and the compositor skips them (no decoder teardown, so coming back up is instant). Footer reveals animate only `opacity` and `transform`.
+- **Clips use a short keyframe interval with no B-frames,** so a random seek decodes at most 7 frames (the raw files had one keyframe per clip). The canvas path depends on both: each GOP is decoded on its own, and a clip with B-frames is refused there and plays from its `<video>`. Keep `-g` and `-bf 0` in `scripts/encode.sh`.
+- **Captions animate only `opacity` and `transform`,** and each value is written only when it changes. React never re-renders per frame.
+- **Liquid glass (`backdrop-filter`) is limited to small surfaces:** the nav, badge and cards.
+- **The film grain plate is exactly viewport-sized.** It used to be 200% in each direction, which cost Safari a 4× full-screen texture for nothing.
+- `prefers-reduced-motion` shows still frames per scene with no video downloads, and captions don't move.
 
 ## Hosting the clips on a CDN
 

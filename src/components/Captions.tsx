@@ -23,7 +23,6 @@ export const Captions = memo(function Captions({ engine }: { engine: FilmEngine 
   )
 })
 
-export const scrollToRange = () => document.getElementById('range')?.scrollIntoView({ behavior: 'smooth' })
 
 const size = (v: string) => ({ fontSize: `var(${v})` })
 
@@ -108,7 +107,7 @@ function CaptionView({ caption: c, engine }: { caption: Caption; engine: FilmEng
             </h2>
             <p className="mt-4 max-w-[30ch] leading-relaxed text-cream/72 short:hidden">Six flavors, one summit. Golden Eagle Energy Drink.</p>
             <div className="mt-7 flex w-full flex-col gap-2.5 sm:w-auto sm:flex-row short:mt-4">
-              <button type="button" onClick={scrollToRange} className="btn btn-gold">
+              <button type="button" onClick={engine.toRange} className="btn btn-gold">
                 The Range
                 <span className="btn-icon">
                   <ArrowDown />

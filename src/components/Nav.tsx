@@ -2,7 +2,6 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { FilmEngine } from '../film/FilmEngine'
 import { CHAPTERS, FLAVORS, FLAVOR_SCENES } from '../film/scenes'
 import { ArrowDown } from './Icons'
-import { scrollToRange } from './Captions'
 
 /**
  * Floating "island" navigation + full-screen chapter menu.
@@ -158,7 +157,7 @@ export function Nav({ engine }: { engine: FilmEngine }) {
             <div className="ml-auto flex items-center gap-1.5 lg:ml-2">
               <button
                 type="button"
-                onClick={scrollToRange}
+                onClick={engine.toRange}
                 className="btn btn-gold !gap-3 !py-1.5 !pr-1.5 !pl-4 !text-[0.8rem] max-sm:hidden"
               >
                 The Range
