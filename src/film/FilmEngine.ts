@@ -480,7 +480,7 @@ export class FilmEngine {
   }
   // wheel and trackpad input: a weighted glide, like a camera on a fluid head
   private onWheel = (e: WheelEvent) => {
-    this.omega = 13
+    this.omega = 11
     this.lastInput = performance.now()
     if (!this.glide || e.ctrlKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return // pinch-zoom, sideways
     const root = document.documentElement

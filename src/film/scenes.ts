@@ -9,7 +9,7 @@
 export const FPS = 24
 
 /** Scroll distance per second of footage, in viewport heights. */
-export const VH_PER_SECOND = 56
+export const VH_PER_SECOND = 72
 
 export type CaptionSide = 'left' | 'left-top' | 'center'
 
@@ -164,23 +164,23 @@ export const SCENES: Scene[] = [
     id: 'shatter',
     file: '03',
     frames: 146,
-    holdVh: 90,
+    holdVh: 110,
     chapter: 'Flavors',
     captions: [
       { id: 'unleashed', from: 0.3, to: 0.82, layout: 'statement', title: '*Unbound.*', side: 'center' },
       flavorCaption(FLAVORS[0]),
     ],
   },
-  { id: 'red', file: '04', frames: 146, holdVh: 80, captions: [flavorCaption(FLAVORS[1])] },
-  { id: 'sugarfree', file: '05', frames: 122, holdVh: 80, captions: [flavorCaption(FLAVORS[2])] },
-  { id: 'tropical', file: '06', frames: 122, holdVh: 80, captions: [flavorCaption(FLAVORS[3])] },
-  { id: 'strawberry', file: '07', frames: 122, holdVh: 80, captions: [flavorCaption(FLAVORS[4])] },
-  { id: 'coffee', file: '08', frames: 122, holdVh: 80, captions: [flavorCaption(FLAVORS[5])] },
+  { id: 'red', file: '04', frames: 146, holdVh: 100, captions: [flavorCaption(FLAVORS[1])] },
+  { id: 'sugarfree', file: '05', frames: 122, holdVh: 100, captions: [flavorCaption(FLAVORS[2])] },
+  { id: 'tropical', file: '06', frames: 122, holdVh: 100, captions: [flavorCaption(FLAVORS[3])] },
+  { id: 'strawberry', file: '07', frames: 122, holdVh: 100, captions: [flavorCaption(FLAVORS[4])] },
+  { id: 'coffee', file: '08', frames: 122, holdVh: 100, captions: [flavorCaption(FLAVORS[5])] },
   {
     id: 'energy',
     file: '09',
     frames: 122,
-    holdVh: 60,
+    holdVh: 75,
     chapter: 'Energy',
     captions: [
       {
@@ -198,7 +198,7 @@ export const SCENES: Scene[] = [
     id: 'movement',
     file: '10',
     frames: 122,
-    holdVh: 60,
+    holdVh: 75,
     chapter: 'Movement',
     focusX: 0.56,
     captions: [
@@ -217,7 +217,7 @@ export const SCENES: Scene[] = [
     id: 'kosovo',
     file: '11',
     frames: 194,
-    holdVh: 50,
+    holdVh: 65,
     chapter: 'Kosovo',
     focusX: 0.62,
     captions: [
@@ -236,7 +236,7 @@ export const SCENES: Scene[] = [
     id: 'world',
     file: '12',
     frames: 146,
-    holdVh: 50,
+    holdVh: 65,
     chapter: 'World',
     captions: [
       {
@@ -253,7 +253,7 @@ export const SCENES: Scene[] = [
     id: 'return',
     file: '13',
     frames: 146,
-    holdVh: 130,
+    holdVh: 160,
     chapter: 'Rise',
     captions: [{ id: 'final', from: 0.82, to: 2.2, layout: 'final', title: 'Rise *above.*', side: 'center' }],
   },
